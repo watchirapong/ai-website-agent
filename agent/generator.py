@@ -7,14 +7,74 @@ and ensuring required configs exist.
 
 import json
 import re
+import logging
 
-from agent.config import OUTPUT_DIR
+import agent.config as cfg
+
+logger = logging.getLogger("agent.generator")
+
+_PATH_EXT = (".tsx", ".ts", ".jsx", ".js", ".css", ".json", ".mjs", ".cjs")
+_LANG_TAGS = frozenset(
+    {
+        "",
+        "ts",
+        "tsx",
+        "typescript",
+        "js",
+        "jsx",
+        "javascript",
+        "css",
+        "json",
+        "text",
+    }
+)
+
+
+def _is_rel_path_tag(tag: str) -> bool:
+    t = (tag or "").strip()
+    if not t or t in _LANG_TAGS:
+        return False
+    if "/" in t or t.endswith(_PATH_EXT):
+        return True
+    return False
+
+
+def _strip_inline_path_comment(content: str) -> str:
+    lines = content.splitlines()
+    if not lines:
+        return content
+    first = lines[0].strip()
+    if re.match(r"^(//|#)\s*(file|path)\s*:\s*\S+", first, re.I):
+        return "\n".join(lines[1:]).lstrip("\n")
+    return content
+
+
+def _path_from_prose_before(raw: str, fence_start: int) -> str | None:
+    before = raw[:fence_start].rstrip()
+    lines = [ln.strip() for ln in before.splitlines() if ln.strip()]
+    for ln in reversed(lines[-8:]):
+        m = re.search(r"`([^`]+\.(?:tsx?|jsx?|css|json))`", ln)
+        if m:
+            p = m.group(1).strip().strip("*")
+            if p:
+                return p
+        m = re.search(
+            r"(?:^|\s)((?:[\w.-]+/)+[\w.-]+\.(?:tsx?|jsx?|css|json))(?:\s*[`*]*\s*)?$",
+            ln,
+        )
+        if m:
+            return m.group(1).strip()
+        m = re.search(r"\(([\w./]+\.(?:tsx?|jsx?|css|json))\)", ln)
+        if m:
+            return m.group(1).strip()
+    return None
 
 
 def parse_files_from_response(raw: str) -> dict[str, str]:
     """Extract file path -> content pairs from LLM response.
 
-    Expects ```filepath\\ncontent\\n``` blocks or a JSON dict.
+    Expects ```filepath\\ncontent\\n``` blocks, language-only fences with a path
+    on a nearby prose line, or a JSON dict.
     """
     try:
         data = json.loads(raw)
@@ -26,11 +86,19 @@ def parse_files_from_response(raw: str) -> dict[str, str]:
         pass
 
     files: dict[str, str] = {}
-    pattern = r"```(\S+)\n(.*?)```"
+    pattern = r"```([^\n`]*)\n(.*?)```"
     for match in re.finditer(pattern, raw, re.DOTALL):
-        filepath = match.group(1)
+        tag = (match.group(1) or "").strip()
         content = match.group(2).strip()
-        if "/" in filepath or filepath.endswith((".tsx", ".ts", ".css", ".js", ".json")):
+        content = _strip_inline_path_comment(content)
+
+        filepath: str | None = None
+        if _is_rel_path_tag(tag):
+            filepath = tag
+        else:
+            filepath = _path_from_prose_before(raw, match.start())
+
+        if filepath and ("/" in filepath or filepath.endswith(_PATH_EXT)):
             files[filepath] = content
 
     if not files:
@@ -39,13 +107,40 @@ def parse_files_from_response(raw: str) -> dict[str, str]:
     return files
 
 
+def materialize_site_from_raw(raw: str, *, reset_output_dir: bool = True) -> dict[str, object]:
+    """Parse LLM output, ensure boilerplate, write under cfg.OUTPUT_DIR.
+
+    Shared by the write_website_files tool and the pipeline fallback.
+    """
+    import shutil
+
+    if reset_output_dir:
+        if cfg.OUTPUT_DIR.exists():
+            shutil.rmtree(cfg.OUTPUT_DIR)
+        cfg.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    parsed = parse_files_from_response(raw)
+    parsed = ensure_package_json(parsed)
+    parsed = ensure_configs(parsed)
+    written = write_files(parsed)
+    return {"files_written": len(written), "paths": written}
+
+
 def write_files(files: dict[str, str]) -> list[str]:
     """Write generated files to OUTPUT_DIR. Returns list of written paths."""
     written: list[str] = []
     for rel_path, content in files.items():
-        full = OUTPUT_DIR / rel_path
+        full = cfg.OUTPUT_DIR / rel_path
         full.parent.mkdir(parents=True, exist_ok=True)
-        full.write_text(content)
+        snippet_lines = (content or "").splitlines()[:14]
+        snippet = "\n".join(snippet_lines)
+        logger.info(
+            "[code] writing %s\n%s%s",
+            rel_path,
+            snippet,
+            "\n... (truncated)" if len((content or "").splitlines()) > 14 else "",
+        )
+        full.write_text(content, encoding="utf-8")
         written.append(rel_path)
     return written
 

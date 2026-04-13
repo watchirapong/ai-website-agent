@@ -1,7 +1,8 @@
 """Build validation: runs npm install + next build and captures errors."""
 
 import subprocess
-from agent.config import OUTPUT_DIR
+
+import agent.config as cfg
 
 
 def run_install() -> tuple[bool, str]:
@@ -11,10 +12,11 @@ def run_install() -> tuple[bool, str]:
     """
     result = subprocess.run(
         ["npm", "install"],
-        cwd=str(OUTPUT_DIR),
+        cwd=str(cfg.OUTPUT_DIR),
         capture_output=True,
         text=True,
         timeout=120,
+        **cfg.SUBPROCESS_TEXT_KW,
     )
     output = result.stdout + result.stderr
     return result.returncode == 0, output
@@ -27,10 +29,11 @@ def run_build() -> tuple[bool, str]:
     """
     result = subprocess.run(
         ["npx", "next", "build"],
-        cwd=str(OUTPUT_DIR),
+        cwd=str(cfg.OUTPUT_DIR),
         capture_output=True,
         text=True,
         timeout=180,
+        **cfg.SUBPROCESS_TEXT_KW,
     )
     output = result.stdout + result.stderr
     return result.returncode == 0, output

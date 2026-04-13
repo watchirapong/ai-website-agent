@@ -3,19 +3,34 @@
 import json
 import shutil
 import time
+import textwrap
 from typing import Callable
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
 from crewai import Agent, Task, Crew, Process
 
+import agent.config as cfg
 from agent.config import (
-    OUTPUT_DIR,
+    BASE_OUTPUT_DIR,
     MAX_RETRIES,
+    PIPELINE_STEP_TIMEOUT_SECONDS,
+    PLANNER_TIMEOUT_SECONDS,
+    DEVELOPER_TIMEOUT_SECONDS,
+    TESTER_TIMEOUT_SECONDS,
+    REVIEWER_TIMEOUT_SECONDS,
+    DEPLOYER_TIMEOUT_SECONDS,
+    ENABLE_TESTER,
+    ENABLE_REVIEWER,
+    LLM_EMPTY_RESULT_RETRIES,
+    LLM_EMPTY_RESULT_BACKOFF_SECONDS,
     PROMPTS_DIR,
     ensure_dirs,
     get_llm,
 )
-from agent.planner import parse_plan
+from agent.generator import materialize_site_from_raw
+from agent.planner import parse_plan, fallback_plan_from_prompt
 from agent.reviewer import check_thresholds, compute_score
+from agent.validator import validate as run_validate_build
 from agent.tools import (
     write_website_files,
     validate_build,
@@ -25,13 +40,69 @@ from agent.tools import (
 
 
 def _load_prompt(name: str) -> str:
-    return (PROMPTS_DIR / name).read_text()
+    return (PROMPTS_DIR / name).read_text(encoding="utf-8")
 
 
 def _clean_output():
-    if OUTPUT_DIR.exists():
-        shutil.rmtree(OUTPUT_DIR)
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    if cfg.OUTPUT_DIR.exists():
+        shutil.rmtree(cfg.OUTPUT_DIR)
+    cfg.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _kickoff_with_timeout(
+    crew: Crew,
+    step_name: str,
+    timeout_seconds: int = PIPELINE_STEP_TIMEOUT_SECONDS,
+    on_empty_retry: Callable[[dict], None] | None = None,
+):
+    """Run crew kickoff with a hard timeout to avoid indefinite hangs.
+
+    Important: we intentionally do not block executor shutdown on timeout. CrewAI
+    may keep provider calls alive; waiting for thread join here can freeze the
+    whole pipeline loop and hide retry/cancel progress from the UI.
+    """
+    for retry_idx in range(LLM_EMPTY_RESULT_RETRIES + 1):
+        executor = ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(crew.kickoff)
+        try:
+            result = future.result(timeout=timeout_seconds)
+        except FuturesTimeoutError as e:
+            future.cancel()
+            raise TimeoutError(
+                f"{step_name} timed out after {timeout_seconds}s"
+            ) from e
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+        raw = getattr(result, "raw", None)
+        raw_text = (raw if isinstance(raw, str) else "").strip()
+        if result is not None and raw_text:
+            return result
+
+        if retry_idx < LLM_EMPTY_RESULT_RETRIES:
+            backoff = LLM_EMPTY_RESULT_BACKOFF_SECONDS * (2 ** retry_idx)
+            if on_empty_retry:
+                on_empty_retry(
+                    {
+                        "step": step_name,
+                        "retry": retry_idx + 1,
+                        "max_retries": LLM_EMPTY_RESULT_RETRIES,
+                        "sleep_seconds": backoff,
+                    }
+                )
+            time.sleep(backoff)
+            continue
+
+        raise RuntimeError(
+            f"{step_name} returned empty LLM response after {LLM_EMPTY_RESULT_RETRIES + 1} attempt(s)"
+        )
+
+    raise RuntimeError(f"{step_name} kickoff exhausted unexpectedly")
+
+
+def _short(value: str, limit: int = 240) -> str:
+    v = (value or "").strip().replace("\r", " ").replace("\n", " ")
+    return textwrap.shorten(v, width=limit, placeholder="...")
 
 
 def _build_agents(llm):
@@ -98,6 +169,8 @@ def run_pipeline(
     user_prompt: str,
     on_event: Callable[[str, str, dict], None] | None = None,
     skip_deploy: bool = False,
+    wait_for_approval: Callable[[str, dict], None] | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> dict:
     """Run the full CrewAI agent pipeline.
 
@@ -105,6 +178,7 @@ def run_pipeline(
         user_prompt: The user's website description.
         on_event: Optional callback(step, status, detail) for progress updates.
         skip_deploy: If True, skip the deployment step.
+        wait_for_approval: Optional callback invoked before each major step starts.
 
     Returns:
         dict with keys: url, scores, lighthouse, attempts, passed, time_seconds.
@@ -116,6 +190,14 @@ def run_pipeline(
         if on_event:
             on_event(step, status, detail or {})
 
+    def require_approval(step: str, detail: dict | None = None):
+        if wait_for_approval:
+            wait_for_approval(step, detail or {})
+
+    def ensure_not_stopped():
+        if should_stop and should_stop():
+            raise RuntimeError("Cancelled by user")
+
     pipeline_start = time.time()
     best_score = 0
     best_attempt_report: dict | None = None
@@ -123,6 +205,18 @@ def run_pipeline(
     planner_agent, developer_agent, tester_agent, reviewer_agent, deployer_agent = _build_agents(llm)
 
     # ── Step 1: Plan ──────────────────────────────────────────────
+    ensure_not_stopped()
+    emit(
+        "trace",
+        "decision",
+        {
+            "agent": "planner",
+            "why": "Parse user intent into a strict site plan JSON before code generation.",
+            "input_preview": _short(user_prompt, 300),
+            "timeout_seconds": PLANNER_TIMEOUT_SECONDS,
+        },
+    )
+    require_approval("planner")
     emit("planner", "running")
 
     plan_task = Task(
@@ -142,9 +236,67 @@ def run_pipeline(
         verbose=True,
     )
 
-    plan_result = plan_crew.kickoff()
-    plan = parse_plan(plan_result.raw)
-    emit("planner", "done", {"plan": plan})
+    planner_detail: dict
+    try:
+        ensure_not_stopped()
+        plan_result = _kickoff_with_timeout(
+            plan_crew,
+            "planner",
+            timeout_seconds=PLANNER_TIMEOUT_SECONDS,
+            on_empty_retry=lambda info: emit(
+                "trace",
+                "result",
+                {
+                    "agent": "planner",
+                    "decision": "empty_llm_response_retry",
+                    **info,
+                },
+            ),
+        )
+        emit(
+            "trace",
+            "result",
+            {
+                "agent": "planner",
+                "raw_output_preview": _short(plan_result.raw, 320),
+            },
+        )
+        try:
+            plan = parse_plan(plan_result.raw)
+            planner_detail = {"plan": plan}
+        except Exception as e:
+            plan = fallback_plan_from_prompt(user_prompt)
+            planner_detail = {
+                "plan": plan,
+                "fallback_used": True,
+                "fallback_reason": str(e),
+            }
+            emit(
+                "trace",
+                "result",
+                {
+                    "agent": "planner",
+                    "decision": "fallback_plan_used",
+                    "reason": str(e),
+                },
+            )
+    except TimeoutError as e:
+        plan = fallback_plan_from_prompt(user_prompt)
+        planner_detail = {
+            "plan": plan,
+            "fallback_used": True,
+            "fallback_reason": str(e),
+        }
+        emit(
+            "trace",
+            "result",
+            {
+                "agent": "planner",
+                "decision": "fallback_plan_used",
+                "reason": str(e),
+            },
+        )
+    emit("planner", "done", planner_detail)
 
     # ── Steps 2-6: Generate → Build → Test → Review (retry loop) ─
     fix_instructions = None
@@ -152,10 +304,32 @@ def run_pipeline(
     attempt = 0
 
     for attempt in range(1, MAX_RETRIES + 1):
+        ensure_not_stopped()
+        attempt_output_dir = BASE_OUTPUT_DIR.parent / f"{BASE_OUTPUT_DIR.name}_attempt_{attempt}"
+        cfg.set_output_dir(attempt_output_dir)
         emit("attempt", "start", {"attempt": attempt, "max": MAX_RETRIES})
+        emit(
+            "runtime",
+            "output_dir",
+            {"attempt": attempt, "path": str(cfg.OUTPUT_DIR)},
+        )
+        emit(
+            "trace",
+            "decision",
+            {
+                "agent": "developer",
+                "why": "Generate full Next.js project, then call write_website_files and validate_build.",
+                "attempt": attempt,
+                "has_fix_feedback": bool(fix_instructions),
+                "fix_preview": _short(fix_instructions or "", 260),
+                "timeout_seconds": DEVELOPER_TIMEOUT_SECONDS,
+            },
+        )
 
         # Step 2: Generate code
         _clean_output()
+        ensure_not_stopped()
+        require_approval("developer", {"attempt": attempt, "max": MAX_RETRIES})
         emit("developer", "running")
 
         dev_description = (
@@ -183,61 +357,248 @@ def run_pipeline(
             verbose=True,
         )
 
-        dev_result = dev_crew.kickoff()
-        emit("developer", "done", {"output": dev_result.raw[:500]})
-
-        # Check if build passed by looking at the output
-        build_output = dev_result.raw
-        if "success" in build_output.lower() and "false" in build_output.lower():
-            emit("build", "failed", {"output": build_output[:500]})
-            fix_instructions = f"Build failed. Developer output:\n{build_output[:1000]}"
+        try:
+            ensure_not_stopped()
+            dev_result = _kickoff_with_timeout(
+                dev_crew,
+                "developer",
+                timeout_seconds=DEVELOPER_TIMEOUT_SECONDS,
+                on_empty_retry=lambda info: emit(
+                    "trace",
+                    "result",
+                    {
+                        "agent": "developer",
+                        "decision": "empty_llm_response_retry",
+                        "attempt": attempt,
+                        **info,
+                    },
+                ),
+            )
+        except TimeoutError as e:
+            emit("developer", "failed", {"error": str(e)})
+            emit(
+                "trace",
+                "result",
+                {"agent": "developer", "status": "timeout", "error": str(e)},
+            )
+            fix_instructions = (
+                f"Developer step timed out. Keep output concise and always call tools once. Error: {e}"
+            )
             continue
-        emit("build", "done")
+        emit("developer", "done", {"output": dev_result.raw[:500]})
+        emit(
+            "trace",
+            "result",
+            {
+                "agent": "developer",
+                "raw_output_preview": _short(dev_result.raw, 320),
+            },
+        )
+
+        try:
+            mat = materialize_site_from_raw(dev_result.raw or "", reset_output_dir=True)
+        except ValueError as e:
+            emit("developer", "materialize_failed", {"error": str(e)})
+            emit(
+                "trace",
+                "result",
+                {
+                    "agent": "developer",
+                    "materialized": False,
+                    "error": str(e),
+                },
+            )
+            fix_instructions = (
+                "Could not parse file fences from your output. For each file use:\n"
+                "```app/page.tsx\n// file content\n```\n"
+                "The opening fence line must be the relative path (e.g. app/page.tsx), not bare ```tsx. "
+                "Put the path on that same line if you use a language-only fence."
+            )
+            continue
+
+        paths_preview = mat["paths"][:12] if isinstance(mat.get("paths"), list) else []
+        emit(
+            "trace",
+            "result",
+            {
+                "agent": "developer",
+                "materialized_from_raw": True,
+                "files_written": mat.get("files_written", 0),
+                "paths_preview": [str(p) for p in paths_preview],
+            },
+        )
+
+        build_ok, build_output = run_validate_build()
+        if not build_ok:
+            emit("build", "failed", {"output": build_output[:2000]})
+            emit(
+                "trace",
+                "decision",
+                {
+                    "agent": "review-loop",
+                    "why": "npm install or next build failed after materializing files.",
+                    "build_output_preview": _short(build_output, 320),
+                },
+            )
+            fix_instructions = f"Build failed.\n{build_output[:1500]}"
+            continue
+        emit("build", "done", {"output": build_output[:500]})
 
         # Step 4: Test
-        emit("tester", "running")
+        if not ENABLE_TESTER:
+            test_report = {}
+            emit(
+                "tester",
+                "done",
+                {
+                    "skipped": True,
+                    "reason": "Tester disabled by ENABLE_TESTER=0",
+                    "report": test_report,
+                },
+            )
+            emit(
+                "trace",
+                "result",
+                {
+                    "agent": "tester",
+                    "decision": "skipped",
+                    "reason": "Tester disabled by ENABLE_TESTER=0",
+                },
+            )
+        else:
+            require_approval("tester", {"attempt": attempt, "max": MAX_RETRIES})
+            ensure_not_stopped()
+            emit("tester", "running")
+            emit(
+                "trace",
+                "decision",
+                {
+                    "agent": "tester",
+                    "why": "Run tool-driven quality checks (screenshots, Lighthouse, console, links, load time).",
+                    "attempt": attempt,
+                    "timeout_seconds": TESTER_TIMEOUT_SECONDS,
+                },
+            )
 
-        test_task = Task(
-            description=(
-                "Test the generated website by calling the test_website tool. "
-                "It handles everything automatically (starts server, runs tests, stops server). "
-                "Return the complete JSON test report from the tool output."
-            ),
-            expected_output="Complete JSON test report with lighthouse scores, screenshots, console_errors, broken_links, and load_time_ms.",
-            agent=tester_agent,
-        )
+            test_task = Task(
+                description=(
+                    "Test the generated website by calling the test_website tool. "
+                    "It handles everything automatically (starts server, runs tests, stops server). "
+                    "Return the complete JSON test report from the tool output."
+                ),
+                expected_output="Complete JSON test report with lighthouse scores, screenshots, console_errors, broken_links, and load_time_ms.",
+                agent=tester_agent,
+            )
 
-        test_crew = Crew(
-            agents=[tester_agent],
-            tasks=[test_task],
-            process=Process.sequential,
-            verbose=True,
-        )
+            test_crew = Crew(
+                agents=[tester_agent],
+                tasks=[test_task],
+                process=Process.sequential,
+                verbose=True,
+            )
 
-        test_result = test_crew.kickoff()
+            try:
+                ensure_not_stopped()
+                test_result = _kickoff_with_timeout(
+                    test_crew,
+                    "tester",
+                    timeout_seconds=TESTER_TIMEOUT_SECONDS,
+                    on_empty_retry=lambda info: emit(
+                        "trace",
+                        "result",
+                        {
+                            "agent": "tester",
+                            "decision": "empty_llm_response_retry",
+                            "attempt": attempt,
+                            **info,
+                        },
+                    ),
+                )
+            except TimeoutError as e:
+                emit("tester", "failed", {"error": str(e)})
+                emit(
+                    "trace",
+                    "result",
+                    {"agent": "tester", "status": "timeout", "error": str(e)},
+                )
+                fix_instructions = f"Tester step timed out: {e}"
+                continue
 
-        # Parse the test report from the tester's output
-        try:
-            test_report = json.loads(test_result.raw)
-        except (json.JSONDecodeError, ValueError):
-            raw = test_result.raw
-            start = raw.find("{")
-            end = raw.rfind("}") + 1
-            if start != -1 and end > 0:
-                try:
-                    test_report = json.loads(raw[start:end])
-                except json.JSONDecodeError:
+            # Parse the test report from the tester's output
+            try:
+                test_report = json.loads(test_result.raw)
+            except (json.JSONDecodeError, ValueError):
+                raw = test_result.raw
+                start = raw.find("{")
+                end = raw.rfind("}") + 1
+                if start != -1 and end > 0:
+                    try:
+                        test_report = json.loads(raw[start:end])
+                    except json.JSONDecodeError:
+                        test_report = {"lighthouse": {"performance": 0, "accessibility": 0, "best_practices": 0, "seo": 0}}
+                else:
                     test_report = {"lighthouse": {"performance": 0, "accessibility": 0, "best_practices": 0, "seo": 0}}
-            else:
-                test_report = {"lighthouse": {"performance": 0, "accessibility": 0, "best_practices": 0, "seo": 0}}
 
-        emit("tester", "done", {"report": test_report})
+            emit("tester", "done", {"report": test_report})
+            emit(
+                "trace",
+                "result",
+                {
+                    "agent": "tester",
+                    "lighthouse": test_report.get("lighthouse", {}),
+                    "console_error_count": len(test_report.get("console_errors", [])),
+                    "broken_link_count": len(test_report.get("broken_links", [])),
+                    "load_time_ms": test_report.get("load_time_ms"),
+                },
+            )
 
         # Step 5: Review
+        if not ENABLE_REVIEWER:
+            overall_score = compute_score(test_report)
+            review_result = {
+                "passed": True,
+                "score": overall_score,
+                "issues": [],
+                "fix_instructions": None,
+                "skipped": True,
+                "reason": "Reviewer disabled by ENABLE_REVIEWER=0",
+            }
+            emit("reviewer", "done", review_result)
+            emit(
+                "trace",
+                "result",
+                {
+                    "agent": "reviewer",
+                    "decision": "skipped",
+                    "reason": "Reviewer disabled by ENABLE_REVIEWER=0",
+                },
+            )
+            if overall_score > best_score:
+                best_score = overall_score
+                best_attempt_report = {
+                    "attempt": attempt,
+                    "report": test_report,
+                    "review": review_result,
+                }
+            break
+
+        require_approval("reviewer", {"attempt": attempt, "max": MAX_RETRIES})
+        ensure_not_stopped()
         emit("reviewer", "running")
 
         threshold_issues = check_thresholds(test_report)
         overall_score = compute_score(test_report)
+        emit(
+            "trace",
+            "decision",
+            {
+                "agent": "reviewer",
+                "why": "Evaluate thresholds and decide PASS vs RETRY.",
+                "score": overall_score,
+                "issues": threshold_issues,
+                "timeout_seconds": REVIEWER_TIMEOUT_SECONDS,
+            },
+        )
 
         if not threshold_issues:
             review_result = {
@@ -247,6 +608,7 @@ def run_pipeline(
                 "fix_instructions": None,
             }
             emit("reviewer", "done", review_result)
+            emit("trace", "result", {"agent": "reviewer", "decision": "pass"})
         else:
             review_task = Task(
                 description=(
@@ -267,7 +629,21 @@ def run_pipeline(
                 verbose=True,
             )
 
-            review_crew_result = review_crew.kickoff()
+            review_crew_result = _kickoff_with_timeout(
+                review_crew,
+                "reviewer",
+                timeout_seconds=REVIEWER_TIMEOUT_SECONDS,
+                on_empty_retry=lambda info: emit(
+                    "trace",
+                    "result",
+                    {
+                        "agent": "reviewer",
+                        "decision": "empty_llm_response_retry",
+                        "attempt": attempt,
+                        **info,
+                    },
+                ),
+            )
             fix_instructions = review_crew_result.raw
 
             review_result = {
@@ -277,6 +653,16 @@ def run_pipeline(
                 "fix_instructions": fix_instructions,
             }
             emit("reviewer", "done", review_result)
+            emit(
+                "trace",
+                "result",
+                {
+                    "agent": "reviewer",
+                    "decision": "retry",
+                    "issues": threshold_issues,
+                    "fix_instructions_preview": _short(fix_instructions, 320),
+                },
+            )
 
         # Track best version
         if overall_score > best_score:
@@ -293,6 +679,17 @@ def run_pipeline(
     # ── Step 7: Deploy ────────────────────────────────────────────
     deployed_url = None
     if not skip_deploy:
+        ensure_not_stopped()
+        emit(
+            "trace",
+            "decision",
+            {
+                "agent": "deployer",
+                "why": "Deploy only after review passes and skip_deploy is false.",
+                "timeout_seconds": DEPLOYER_TIMEOUT_SECONDS,
+            },
+        )
+        require_approval("deployer")
         emit("deployer", "running")
 
         deploy_task = Task(
@@ -309,7 +706,21 @@ def run_pipeline(
         )
 
         try:
-            deploy_result = deploy_crew.kickoff()
+            ensure_not_stopped()
+            deploy_result = _kickoff_with_timeout(
+                deploy_crew,
+                "deployer",
+                timeout_seconds=DEPLOYER_TIMEOUT_SECONDS,
+                on_empty_retry=lambda info: emit(
+                    "trace",
+                    "result",
+                    {
+                        "agent": "deployer",
+                        "decision": "empty_llm_response_retry",
+                        **info,
+                    },
+                ),
+            )
             try:
                 deploy_data = json.loads(deploy_result.raw)
                 deployed_url = deploy_data.get("url")

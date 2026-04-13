@@ -4,7 +4,7 @@ import subprocess
 import time
 import signal
 import requests as http_requests
-from agent.config import OUTPUT_DIR, PREVIEW_PORT
+import agent.config as cfg
 
 
 _process: subprocess.Popen | None = None
@@ -20,13 +20,15 @@ def start() -> str:
     stop()
 
     _process = subprocess.Popen(
-        ["npx", "next", "start", "-p", str(PREVIEW_PORT)],
-        cwd=str(OUTPUT_DIR),
+        ["npx", "next", "start", "-p", str(cfg.PREVIEW_PORT)],
+        cwd=str(cfg.OUTPUT_DIR),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        text=True,
+        **cfg.SUBPROCESS_TEXT_KW,
     )
 
-    url = f"http://localhost:{PREVIEW_PORT}"
+    url = f"http://localhost:{cfg.PREVIEW_PORT}"
 
     for _ in range(30):
         try:

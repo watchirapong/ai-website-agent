@@ -2,18 +2,48 @@
 
 import subprocess
 import re
-from agent.config import OUTPUT_DIR
+import os
+
+import agent.config as cfg
 
 
 def deploy_to_vercel() -> str:
     """Deploy the output directory to Vercel and return the production URL."""
-    result = subprocess.run(
-        ["vercel", "--prod", "--yes"],
-        cwd=str(OUTPUT_DIR),
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
+    base_cmd = ["vercel", "--prod", "--yes"]
+    try:
+        result = subprocess.run(
+            base_cmd,
+            cwd=str(cfg.OUTPUT_DIR),
+            capture_output=True,
+            text=True,
+            timeout=180,
+            **cfg.SUBPROCESS_TEXT_KW,
+        )
+    except FileNotFoundError:
+        if os.name == "nt":
+            # Windows often resolves CLI shims only through cmd /c or npx.
+            try:
+                result = subprocess.run(
+                    ["cmd", "/c", "vercel", "--prod", "--yes"],
+                    cwd=str(cfg.OUTPUT_DIR),
+                    capture_output=True,
+                    text=True,
+                    timeout=180,
+                    **cfg.SUBPROCESS_TEXT_KW,
+                )
+            except FileNotFoundError:
+                result = subprocess.run(
+                    ["cmd", "/c", "npx", "vercel", "--prod", "--yes"],
+                    cwd=str(cfg.OUTPUT_DIR),
+                    capture_output=True,
+                    text=True,
+                    timeout=180,
+                    **cfg.SUBPROCESS_TEXT_KW,
+                )
+        else:
+            raise RuntimeError(
+                "Vercel CLI not found. Install with `npm i -g vercel` or ensure `vercel` is on PATH."
+            )
 
     combined = result.stdout + result.stderr
 

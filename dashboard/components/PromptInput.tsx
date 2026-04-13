@@ -4,10 +4,11 @@ import { useState } from "react";
 
 interface Props {
   onSubmit: (prompt: string) => void;
+  onStop?: () => void;
   isLoading: boolean;
 }
 
-export default function PromptInput({ onSubmit, isLoading }: Props) {
+export default function PromptInput({ onSubmit, onStop, isLoading }: Props) {
   const [prompt, setPrompt] = useState("");
 
   const handleSubmit = (e: React.FormEvent) => {
@@ -53,14 +54,18 @@ export default function PromptInput({ onSubmit, isLoading }: Props) {
         </div>
 
         <button
-          type="submit"
-          disabled={isLoading || !prompt.trim()}
-          className="rounded-xl bg-blue-600 px-8 py-3 text-sm font-semibold text-white transition hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-40"
+          type={isLoading ? "button" : "submit"}
+          onClick={isLoading ? onStop : undefined}
+          disabled={isLoading ? !onStop : !prompt.trim()}
+          className={`rounded-xl px-8 py-3 text-sm font-semibold text-white transition disabled:cursor-not-allowed disabled:opacity-40 ${
+            isLoading
+              ? "bg-red-600 hover:bg-red-500"
+              : "bg-blue-600 hover:bg-blue-500"
+          }`}
         >
           {isLoading ? (
             <span className="flex items-center gap-2">
-              <span className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-white/30 border-t-white" />
-              Generating...
+              Stop
             </span>
           ) : (
             "Generate"

@@ -12,7 +12,7 @@ from backend.events import event_manager
 _MAX_MSG = 4000
 _MAX_LOG_EVENTS = 2500
 # Named loggers (not root — root is attached once separately).
-_LOGGERS = ("crewai", "LiteLLM", "litellm", "anthropic", "httpx", "openai", "uvicorn", "agent")
+_LOGGERS = ("crewai", "LiteLLM", "litellm", "anthropic", "httpx", "openai", "ollama", "uvicorn", "agent")
 
 
 class _PipelineLogHandler(logging.Handler):

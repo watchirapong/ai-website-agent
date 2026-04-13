@@ -37,8 +37,8 @@ export default function PipelineLogPanel({
     <section>
       <h2 className="mb-4 text-xl font-semibold">Server log</h2>
       <p className="mb-2 text-xs text-gray-500">
-        Python / CrewAI output from this run (streamed from the API). Last{" "}
-        {MAX_LINES} lines shown.
+        Full pipeline event stream (steps, statuses, and details) from this run.
+        Last {MAX_LINES} lines shown.
       </p>
       <pre
         ref={preRef}

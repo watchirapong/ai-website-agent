@@ -7,25 +7,120 @@ import ProgressTracker from "@/components/ProgressTracker";
 import ScoreCards from "@/components/ScoreCards";
 import ScreenshotGrid from "@/components/ScreenshotGrid";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8020";
 /** Remember last run so refresh can reload progress from the API */
 const STORAGE_KEY = "aiagent_active_project";
 
 interface PipelineEvent {
+  seq?: number;
+  timestamp?: string;
   step: string;
   status: string;
   detail: Record<string, unknown>;
 }
 
+interface StatusResponse {
+  status?: string;
+  error?: string | null;
+  attempts?: number;
+  time_seconds?: number;
+  events?: PipelineEvent[];
+}
+
+type StreamMode = "stream" | "polling" | "idle";
+
+function normalizeEvents(raw: PipelineEvent[]): PipelineEvent[] {
+  return raw.map((e) => ({
+    seq: typeof e.seq === "number" ? e.seq : undefined,
+    timestamp: typeof e.timestamp === "string" ? e.timestamp : undefined,
+    step: e.step,
+    status: e.status,
+    detail: (e.detail || {}) as Record<string, unknown>,
+  }));
+}
+
+function formatEventLine(event: PipelineEvent): string {
+  const ts = event.timestamp
+    ? new Date(event.timestamp).toLocaleTimeString()
+    : "";
+  const prefix = ts ? `[${ts}]` : "[event]";
+
+  if (event.step === "log" && event.status === "line") {
+    return `${prefix} ${String(event.detail?.message ?? "")}`;
+  }
+
+  let detailText = "";
+  const detail = event.detail || {};
+  if (Object.keys(detail).length > 0) {
+    try {
+      detailText = ` | detail=${JSON.stringify(detail)}`;
+    } catch {
+      detailText = " | detail=[unserializable]";
+    }
+  }
+
+  const seqText = typeof event.seq === "number" ? `#${event.seq} ` : "";
+  return `${prefix} ${seqText}[${event.step}] ${event.status}${detailText}`;
+}
+
+function isTerminalPipeline(evs: PipelineEvent[]): boolean {
+  return evs.some(
+    (e) =>
+      e.step === "pipeline" &&
+      (e.status === "complete" || e.status === "failed")
+  );
+}
+
+function isTerminalStatus(status?: string): boolean {
+  return status === "completed" || status === "failed";
+}
+
+function mergeEventsBySeq(
+  prev: PipelineEvent[],
+  incoming: PipelineEvent[]
+): PipelineEvent[] {
+  if (incoming.length === 0) return prev;
+  const map = new Map<number, PipelineEvent>();
+  const noSeq: PipelineEvent[] = [];
+  for (const event of prev) {
+    if (typeof event.seq === "number") map.set(event.seq, event);
+    else noSeq.push(event);
+  }
+  for (const event of incoming) {
+    if (typeof event.seq === "number") map.set(event.seq, event);
+    else noSeq.push(event);
+  }
+  const ordered = Array.from(map.entries())
+    .sort((a, b) => a[0] - b[0])
+    .map((entry) => entry[1]);
+  return [...ordered, ...noSeq];
+}
+
+function getLastSeq(events: PipelineEvent[]): number {
+  for (let i = events.length - 1; i >= 0; i--) {
+    if (typeof events[i].seq === "number") return events[i].seq as number;
+  }
+  return 0;
+}
+
+function toErrorMessage(err: unknown, fallback: string): string {
+  if (err instanceof Error) return err.message;
+  return fallback;
+}
+
 function attachEventSource(
   id: string,
+  afterSeq: number,
   opts: {
     onEvent: (e: PipelineEvent) => void;
     onDone: (detail: Record<string, unknown>) => void;
-    onStreamError: () => void;
+    onStreamError: (reason: string) => void;
   }
 ) {
-  const evtSource = new EventSource(`${API_URL}/api/status/${id}/stream`);
+  const q = afterSeq > 0 ? `?after_seq=${afterSeq}` : "";
+  const evtSource = new EventSource(
+    `${API_URL}/api/status/${id}/stream${q}`
+  );
   const finished = { current: false };
 
   evtSource.onmessage = (e) => {
@@ -47,7 +142,7 @@ function attachEventSource(
 
   evtSource.onerror = () => {
     if (finished.current) return;
-    opts.onStreamError();
+    opts.onStreamError("EventSource disconnected");
     evtSource.close();
   };
 
@@ -60,6 +155,8 @@ export default function HomePage() {
   const [isRunning, setIsRunning] = useState(false);
   const [result, setResult] = useState<Record<string, unknown> | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [streamMode, setStreamMode] = useState<StreamMode>("idle");
+  const [approvingStep, setApprovingStep] = useState<string | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const closeStreamRef = useRef<(() => void) | null>(null);
 
@@ -72,23 +169,27 @@ export default function HomePage() {
 
     let cancelled = false;
 
-    const applySnapshot = (raw: PipelineEvent[]) => {
-      const evs = raw.map((e) => ({
-        step: e.step,
-        status: e.status,
-        detail: (e.detail || {}) as Record<string, unknown>,
-      }));
+    const applySnapshot = (data: StatusResponse) => {
+      const evs = normalizeEvents(data.events || []);
       setProjectId(id);
-      setEvents(evs);
-      const terminal = evs.some(
-        (e) =>
-          e.step === "pipeline" &&
-          (e.status === "complete" || e.status === "failed")
-      );
-      if (terminal) {
+      setEvents((prev) => mergeEventsBySeq(prev, evs));
+      if (isTerminalStatus(data.status)) {
+        setResult({
+          error: data.status === "failed" ? data.error || "Pipeline failed" : null,
+          attempts: data.attempts || 0,
+          time_seconds: data.time_seconds || 0,
+        });
+        setIsRunning(false);
+        setStreamMode("idle");
+        sessionStorage.removeItem(STORAGE_KEY);
+        return true;
+      }
+      if (isTerminalPipeline(evs)) {
         const last = [...evs].reverse().find((e) => e.step === "pipeline");
         if (last) setResult(last.detail as Record<string, unknown>);
         setIsRunning(false);
+        setStreamMode("idle");
+        sessionStorage.removeItem(STORAGE_KEY);
         return true;
       }
       setIsRunning(true);
@@ -102,17 +203,16 @@ export default function HomePage() {
           sessionStorage.removeItem(STORAGE_KEY);
           return;
         }
-        const data = (await res.json()) as { events?: PipelineEvent[] };
+        const data = (await res.json()) as StatusResponse;
         if (cancelled) return;
-        const raw = data.events || [];
-        if (applySnapshot(raw)) return;
+        if (applySnapshot(data)) return;
 
         pollRef.current = setInterval(async () => {
           try {
             const r = await fetch(`${API_URL}/api/status/${id}`);
             if (!r.ok) return;
-            const d = (await r.json()) as { events?: PipelineEvent[] };
-            if (applySnapshot(d.events || [])) {
+            const d = (await r.json()) as StatusResponse;
+            if (applySnapshot(d)) {
               if (pollRef.current) clearInterval(pollRef.current);
               pollRef.current = null;
             }
@@ -121,6 +221,7 @@ export default function HomePage() {
           }
         }, 2000);
       } catch {
+        setError(`Cannot reach backend API at ${API_URL}`);
         sessionStorage.removeItem(STORAGE_KEY);
       }
     })();
@@ -128,7 +229,7 @@ export default function HomePage() {
     return () => {
       cancelled = true;
       if (pollRef.current) clearInterval(pollRef.current);
-      if (closeStreamRef.current) closeStreamRef.current();
+      (closeStreamRef.current as (() => void) | null)?.();
     };
   }, []);
 
@@ -138,19 +239,21 @@ export default function HomePage() {
       pollRef.current = null;
     }
     if (closeStreamRef.current) {
-      closeStreamRef.current();
+      (closeStreamRef.current as (() => void) | null)?.();
       closeStreamRef.current = null;
     }
     setEvents([]);
     setResult(null);
     setError(null);
+    setStreamMode("idle");
+    setApprovingStep(null);
     setIsRunning(true);
 
     try {
       const res = await fetch(`${API_URL}/api/generate`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt }),
+        body: JSON.stringify({ prompt, manual_approval: false }),
       });
 
       if (!res.ok) {
@@ -167,29 +270,147 @@ export default function HomePage() {
         pollRef.current = null;
       }
       if (closeStreamRef.current) {
-        closeStreamRef.current();
+        (closeStreamRef.current as (() => void) | null)?.();
         closeStreamRef.current = null;
       }
 
-      closeStreamRef.current = attachEventSource(id, {
+      /** Hydrate from REST so UI updates even if EventSource fails (firewall, browser, etc.) */
+      let afterSeq = 0;
+      try {
+        const snapRes = await fetch(`${API_URL}/api/status/${id}`);
+        if (snapRes.ok) {
+          const snap = (await snapRes.json()) as StatusResponse;
+          if (isTerminalStatus(snap.status)) {
+            setResult({
+              error:
+                snap.status === "failed"
+                  ? snap.error || "Pipeline failed"
+                  : null,
+              attempts: snap.attempts || 0,
+              time_seconds: snap.time_seconds || 0,
+            });
+            setIsRunning(false);
+            setStreamMode("idle");
+            sessionStorage.removeItem(STORAGE_KEY);
+            return;
+          }
+          const evs = normalizeEvents(snap.events || []);
+          setEvents((prev) => mergeEventsBySeq(prev, evs));
+          afterSeq = getLastSeq(evs);
+          if (isTerminalPipeline(evs)) {
+            const last = [...evs].reverse().find((e) => e.step === "pipeline");
+            if (last) setResult(last.detail as Record<string, unknown>);
+            setIsRunning(false);
+            setStreamMode("idle");
+            sessionStorage.removeItem(STORAGE_KEY);
+            return;
+          }
+        }
+      } catch {
+        setError(`Status snapshot failed. Trying live stream... API: ${API_URL}`);
+      }
+
+      const startPollFallback = (reason: string) => {
+        if (pollRef.current) return;
+        setStreamMode("polling");
+        setError(
+          (prev: string | null) =>
+            prev ||
+            `Live stream unavailable (${reason}) — refreshing via HTTP. API: ${API_URL}`
+        );
+        pollRef.current = setInterval(async () => {
+          try {
+            const r = await fetch(`${API_URL}/api/status/${id}`);
+            if (!r.ok) return;
+            const d = (await r.json()) as StatusResponse;
+            if (isTerminalStatus(d.status)) {
+              setResult({
+                error:
+                  d.status === "failed" ? d.error || "Pipeline failed" : null,
+                attempts: d.attempts || 0,
+                time_seconds: d.time_seconds || 0,
+              });
+              setIsRunning(false);
+              setStreamMode("idle");
+              sessionStorage.removeItem(STORAGE_KEY);
+              if (pollRef.current) clearInterval(pollRef.current);
+              pollRef.current = null;
+              return;
+            }
+            const evs = normalizeEvents(d.events || []);
+            setEvents((prev) => mergeEventsBySeq(prev, evs));
+            if (isTerminalPipeline(evs)) {
+              const last = [...evs].reverse().find((e) => e.step === "pipeline");
+              if (last) setResult(last.detail as Record<string, unknown>);
+              setIsRunning(false);
+              setStreamMode("idle");
+              sessionStorage.removeItem(STORAGE_KEY);
+              if (pollRef.current) clearInterval(pollRef.current);
+              pollRef.current = null;
+            }
+          } catch (pollErr) {
+            setError(
+              `HTTP polling failed: ${toErrorMessage(pollErr, "unknown error")}`
+            );
+          }
+        }, 1500);
+      };
+
+      setStreamMode("stream");
+      closeStreamRef.current = attachEventSource(id, afterSeq, {
         onEvent: (event) =>
-          setEvents((prev) => [...prev, event]),
+          setEvents((prev) => mergeEventsBySeq(prev, [event])),
         onDone: (detail) => {
           setResult(detail);
           setIsRunning(false);
+          setStreamMode("idle");
+          if (pollRef.current) {
+            clearInterval(pollRef.current);
+            pollRef.current = null;
+          }
         },
-        onStreamError: () => {
-          setError(
-            "Lost connection to progress stream. Is the API running on " +
-              API_URL +
-              "?"
-          );
-          setIsRunning(false);
+        onStreamError: (reason) => {
+          startPollFallback(reason);
         },
       });
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Request failed");
+      setError(`Generate request failed: ${toErrorMessage(e, "unknown error")}`);
       setIsRunning(false);
+      setStreamMode("idle");
+    }
+  };
+
+  const handleStop = async () => {
+    if (!projectId || !isRunning) return;
+    try {
+      const res = await fetch(`${API_URL}/api/stop/${projectId}`, { method: "POST" });
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(text || `HTTP ${res.status}`);
+      }
+      setError("Stop requested. Waiting for pipeline to end...");
+    } catch (e) {
+      setError(`Stop request failed: ${toErrorMessage(e, "unknown error")}`);
+    }
+  };
+
+  const handleApproveStep = async (step: string) => {
+    if (!projectId || approvingStep) return;
+    setApprovingStep(step);
+    try {
+      const res = await fetch(`${API_URL}/api/approve/${projectId}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ step }),
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(text || `HTTP ${res.status}`);
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Approve request failed");
+    } finally {
+      setApprovingStep(null);
     }
   };
 
@@ -216,10 +437,12 @@ export default function HomePage() {
 
   const logLines = useMemo(
     () =>
-      events
-        .filter((e) => e.step === "log" && e.status === "line")
-        .map((e) => String(e.detail?.message ?? "")),
+      events.map((e) => formatEventLine(e)),
     [events]
+  );
+  const codeLines = useMemo(
+    () => logLines.filter((l) => l.includes("[code]")),
+    [logLines]
   );
 
   return (
@@ -232,7 +455,12 @@ export default function HomePage() {
           Describe the website you want. The AI will build, test, and deploy it
           automatically.
         </p>
-        <PromptInput onSubmit={handleGenerate} isLoading={isRunning} />
+        <PromptInput onSubmit={handleGenerate} onStop={handleStop} isLoading={isRunning} />
+        {isRunning && (
+          <p className="mt-2 text-xs text-gray-500">
+            Connection mode: {streamMode === "stream" ? "live stream" : streamMode === "polling" ? "HTTP polling fallback" : "starting"}
+          </p>
+        )}
         <p className="mt-4 text-xs text-gray-500">
           Full stderr/stdout still appears in the{" "}
           <code className="rounded bg-gray-800 px-1 py-0.5">uvicorn</code>{" "}
@@ -246,10 +474,19 @@ export default function HomePage() {
         )}
       </section>
 
-      {events.length > 0 && (
+      {(events.length > 0 || (isRunning && projectId)) && (
         <section>
           <h2 className="mb-4 text-xl font-semibold">Progress</h2>
-          <ProgressTracker events={events} />
+          {events.length === 0 && isRunning && (
+            <p className="mb-4 text-sm text-gray-500">
+              Connecting to the pipeline…
+            </p>
+          )}
+          <ProgressTracker
+            events={events}
+            onApproveStep={handleApproveStep}
+            approvingStep={approvingStep}
+          />
         </section>
       )}
 
@@ -258,6 +495,20 @@ export default function HomePage() {
         show={!!projectId && (isRunning || logLines.length > 0)}
         waiting={isRunning && logLines.length === 0}
       />
+
+      {!!projectId && (isRunning || codeLines.length > 0) && (
+        <section>
+          <h2 className="mb-4 text-xl font-semibold">Live Code Stream</h2>
+          <p className="mb-2 text-xs text-gray-500">
+            Real-time snippets of files as the AI writes them.
+          </p>
+          <pre className="max-h-[24rem] overflow-auto rounded-lg border border-gray-800 bg-black/60 p-4 font-mono text-[11px] leading-relaxed text-gray-300">
+            {(codeLines.length > 0
+              ? codeLines.join("\n")
+              : "Waiting for code output...")}
+          </pre>
+        </section>
+      )}
 
       {latestLighthouse && (
         <section>

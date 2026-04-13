@@ -654,6 +654,28 @@ sse-starlette>=2.1.0
 
 ## Usage
 
+### Recommended (clean start every time)
+
+```powershell
+.\scripts\dev-reset.ps1
+```
+
+This script kills stale listeners and restarts:
+- Backend on `:8011` (isolated to avoid stale `:8000` listeners)
+- Dashboard on `:3001`
+
+### Generate and wait for final status (no manual polling)
+
+```powershell
+.\scripts\generate-and-wait.ps1 -Prompt "Create a modern agency landing page"
+```
+
+Optional:
+
+```powershell
+.\scripts\generate-and-wait.ps1 -ApiBase "http://127.0.0.1:8020"
+```
+
 ### Start the system (2 terminals)
 
 ```bash

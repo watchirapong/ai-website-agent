@@ -8,6 +8,8 @@ interface PipelineEvent {
 
 interface Props {
   events: PipelineEvent[];
+  onApproveStep?: (step: string) => void;
+  approvingStep?: string | null;
 }
 
 const STEPS = [
@@ -33,11 +35,12 @@ function pipelineEnded(events: PipelineEvent[]): "running" | "ok" | "failed" {
 function getStepStatus(
   stepKey: string,
   events: PipelineEvent[]
-): "pending" | "running" | "done" | "failed" {
+): "pending" | "waiting" | "running" | "done" | "failed" {
   let latest: string = "pending";
   for (const e of events) {
     if (e.step === stepKey) {
-      if (e.status === "running") latest = "running";
+      if (e.status === "waiting_approval") latest = "waiting";
+      else if (e.status === "running") latest = "running";
       else if (e.status === "done") latest = "done";
       else if (e.status === "failed") latest = "failed";
     }
@@ -46,7 +49,7 @@ function getStepStatus(
   if (end === "failed" && latest === "running") {
     return "failed";
   }
-  return latest as "pending" | "running" | "done" | "failed";
+  return latest as "pending" | "waiting" | "running" | "done" | "failed";
 }
 
 function getStepDetail(stepKey: string, events: PipelineEvent[]): string {
@@ -103,7 +106,11 @@ function getCurrentAttempt(events: PipelineEvent[]): string {
   return "";
 }
 
-export default function ProgressTracker({ events }: Props) {
+export default function ProgressTracker({
+  events,
+  onApproveStep,
+  approvingStep,
+}: Props) {
   const attempt = getCurrentAttempt(events);
 
   return (
@@ -118,6 +125,7 @@ export default function ProgressTracker({ events }: Props) {
 
           const ringColor = {
             pending: "border-gray-700 text-gray-600",
+            waiting: "border-yellow-500 text-yellow-300",
             running: "border-blue-500 text-blue-400 animate-pulse",
             done: "border-green-500 bg-green-500/20 text-green-400",
             failed: "border-red-500 bg-red-500/20 text-red-400",
@@ -125,6 +133,7 @@ export default function ProgressTracker({ events }: Props) {
 
           const textColor = {
             pending: "text-gray-600",
+            waiting: "text-yellow-200",
             running: "text-blue-300",
             done: "text-gray-300",
             failed: "text-red-300",
@@ -142,6 +151,8 @@ export default function ProgressTracker({ events }: Props) {
                   ? "\u2713"
                   : status === "failed"
                   ? "\u2717"
+                  : status === "waiting"
+                  ? "?"
                   : icon}
               </div>
               <div className="flex-1">
@@ -154,6 +165,16 @@ export default function ProgressTracker({ events }: Props) {
               </div>
               {status === "running" && (
                 <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-blue-400/30 border-t-blue-400" />
+              )}
+              {status === "waiting" && onApproveStep && (
+                <button
+                  type="button"
+                  onClick={() => onApproveStep(key)}
+                  disabled={approvingStep === key}
+                  className="rounded-md border border-yellow-600 bg-yellow-900/20 px-3 py-1 text-xs text-yellow-200 hover:bg-yellow-800/30 disabled:opacity-60"
+                >
+                  {approvingStep === key ? "Approving..." : "Approve"}
+                </button>
               )}
             </div>
           );

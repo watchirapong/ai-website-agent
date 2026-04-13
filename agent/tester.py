@@ -1,14 +1,16 @@
 """Agent 3 — QA Engineer: runs Playwright screenshots + Lighthouse audits."""
 
 import json
+import os
 import subprocess
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 from agent.config import (
     PREVIEW_PORT,
-    VIEWPORTS,
-    SCREENSHOTS_DIR,
     REPORTS_DIR,
+    SCREENSHOTS_DIR,
+    SUBPROCESS_TEXT_KW,
+    VIEWPORTS,
 )
 
 
@@ -96,20 +98,42 @@ def _measure_load_time(url: str) -> int:
 def _run_lighthouse(url: str) -> dict:
     """Run Lighthouse CLI and return category scores (0-100)."""
     output_path = str(REPORTS_DIR / "lighthouse.json")
+    base_cmd = [
+        "npx",
+        "lighthouse",
+        url,
+        "--output=json",
+        f"--output-path={output_path}",
+        "--chrome-flags=--headless --no-sandbox",
+        "--quiet",
+    ]
 
-    result = subprocess.run(
-        [
-            "lighthouse",
-            url,
-            "--output=json",
-            f"--output-path={output_path}",
-            "--chrome-flags=--headless --no-sandbox",
-            "--quiet",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
+    try:
+        result = subprocess.run(
+            base_cmd,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            **SUBPROCESS_TEXT_KW,
+        )
+    except FileNotFoundError:
+        if os.name == "nt":
+            # On Windows, shell resolution for npx can require invoking through cmd.
+            result = subprocess.run(
+                ["cmd", "/c", *base_cmd],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                **SUBPROCESS_TEXT_KW,
+            )
+        else:
+            return {
+                "performance": 0,
+                "accessibility": 0,
+                "best_practices": 0,
+                "seo": 0,
+                "error": "npx not found. Please install Node.js/npm and ensure npx is on PATH.",
+            }
 
     if result.returncode != 0 and not Path(output_path).exists():
         return {
@@ -117,10 +141,10 @@ def _run_lighthouse(url: str) -> dict:
             "accessibility": 0,
             "best_practices": 0,
             "seo": 0,
-            "error": result.stderr[:500],
+            "error": (result.stderr or result.stdout)[:500],
         }
 
-    with open(output_path) as f:
+    with open(output_path, encoding="utf-8") as f:
         data = json.load(f)
 
     categories = data.get("categories", {})
@@ -153,6 +177,6 @@ def run_tests(url: str | None = None) -> dict:
     }
 
     report_path = REPORTS_DIR / "test_report.json"
-    report_path.write_text(json.dumps(report, indent=2))
+    report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
     return report
