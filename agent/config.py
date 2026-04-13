@@ -19,6 +19,17 @@ SUBPROCESS_TEXT_KW = {"encoding": "utf-8", "errors": "replace"}
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama").strip().lower()
 AI_PROFILE = os.getenv("AI_PROFILE", "balanced").strip().lower()
 
+# If true, each Crew step uses a very long hard timeout (default 7 days) instead of env caps.
+PIPELINE_UNLIMITED = os.getenv("PIPELINE_UNLIMITED", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+UNLIMITED_STEP_SECONDS = int(
+    os.getenv("PIPELINE_UNLIMITED_STEP_SECONDS", str(86400 * 7))
+)
+
 # Ollama — CrewAI uses the native OpenAI-compatible endpoint (default http://localhost:11434/v1).
 # Pull a model first, e.g.: ollama pull gemma4:latest
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma4:latest").strip()
@@ -35,6 +46,8 @@ if ANTHROPIC_API_KEY:
 DASHBOARD_PORT = int(os.getenv("DASHBOARD_PORT", "3001"))
 BACKEND_PORT = int(os.getenv("BACKEND_PORT", "8000"))
 PREVIEW_PORT = int(os.getenv("PREVIEW_PORT", "3000"))
+# Dev preview spawned by FastAPI GET /output/{id} (separate from agent.server PREVIEW_PORT).
+API_PREVIEW_PORT = int(os.getenv("API_PREVIEW_PORT", "3040"))
 
 # Deploy: "local" = `next start` bound to 127.0.0.1 only (this machine). "vercel" = public Vercel deploy.
 _deploy_target = os.getenv("DEPLOY_TARGET", "local").strip().lower()
@@ -52,6 +65,8 @@ DATABASE_PATH = BASE_DIR / "projects.db"
 def _crew_step_timeout_seconds(env_key: str, default: int, minimum: int = 120) -> int:
     """Seconds for ThreadPoolExecutor around crew.kickoff(). Low env values (e.g. 15) are
     clamped so local LLM steps are not killed by stray machine/user environment settings."""
+    if PIPELINE_UNLIMITED:
+        return max(minimum, UNLIMITED_STEP_SECONDS)
     try:
         v = int(os.getenv(env_key, str(default)))
     except ValueError:
@@ -205,6 +220,8 @@ def get_llm():
             "fast": {"temperature": 0.0, "max_tokens": 256},
             "balanced": {"temperature": 0.2, "max_tokens": 700},
             "quality": {"temperature": 0.3, "max_tokens": 1400},
+            # Large generation budget; override with LLM_MAX_TOKENS / model context as needed.
+            "unrestricted": {"temperature": 0.25, "max_tokens": 16000},
         }
         defaults = profile_defaults.get(AI_PROFILE, profile_defaults["balanced"])
 

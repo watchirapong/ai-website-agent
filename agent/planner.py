@@ -12,10 +12,12 @@ def _extract_json_block(raw: str) -> str:
     """Extract the most likely JSON object block from raw model output."""
     text = (raw or "").strip()
 
-    # Prefer fenced JSON blocks if present.
-    fence = re.search(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", text, re.IGNORECASE)
+    # Prefer full fenced body (do not use non-greedy ``{...}`` — breaks nested objects).
+    fence = re.search(r"```(?:json)?\s*\r?\n([\s\S]*?)```", text, re.IGNORECASE)
     if fence:
-        return fence.group(1)
+        inner = fence.group(1).strip()
+        if inner.startswith("{"):
+            return inner
 
     start = text.find("{")
     end = text.rfind("}")
@@ -36,6 +38,8 @@ def _cleanup_json_like(text: str) -> str:
     s = re.sub(r'(["}\]0-9])\s*\n(\s*")', r"\1,\n\2", s)
     # Add likely-missing commas before array/object starts when key follows value.
     s = re.sub(r'(["}\]0-9])\s*(\s*")', r"\1,\2", s)
+    # After a closing brace (object in array), often missing comma before next "{"
+    s = re.sub(r"}\s*\n(\s*\{)", r"},\n\1", s)
     return s
 
 

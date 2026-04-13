@@ -4,6 +4,7 @@ import sys
 import os
 import json
 import threading
+from pathlib import Path
 from urllib import request as urllib_request
 from urllib import error as urllib_error
 from collections import defaultdict
@@ -13,6 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
@@ -20,6 +22,7 @@ from sse_starlette.sse import EventSourceResponse
 from backend.database import init_db, create_project, update_project, get_project, list_projects, delete_project
 from backend.events import event_manager
 from backend.pipeline_logging import pipeline_log_context
+from backend.preview_manager import ensure_preview_for_output_dir
 from agent.crew import run_pipeline
 from agent.config import (
     REPORTS_DIR,
@@ -36,6 +39,9 @@ from agent.config import (
     ENABLE_TESTER,
     ENABLE_REVIEWER,
     DEPLOY_TARGET,
+    API_PREVIEW_PORT,
+    AI_PROFILE,
+    PIPELINE_UNLIMITED,
 )
 
 app = FastAPI(title="AI Website Agent", version="1.0.0")
@@ -223,6 +229,8 @@ def start_generation(req: GenerateRequest):
             "flags": {
                 "enable_tester": ENABLE_TESTER,
                 "enable_reviewer": ENABLE_REVIEWER,
+                "pipeline_unlimited": PIPELINE_UNLIMITED,
+                "ai_profile": AI_PROFILE,
             },
             "timeouts": {
                 "pipeline": PIPELINE_STEP_TIMEOUT_SECONDS,
@@ -323,6 +331,7 @@ def start_generation(req: GenerateRequest):
                 lighthouse=result.get("lighthouse", {}),
                 attempts=result.get("attempts", 0),
                 time_seconds=result.get("time_seconds", 0),
+                output_dir=result.get("output_dir"),
             )
             _emit_terminal_once(project_id, "complete", result)
         except Exception as e:
@@ -424,6 +433,49 @@ def get_project_detail(project_id: str):
     if project is None:
         raise HTTPException(status_code=404, detail="Project not found")
     return project
+
+
+@app.get("/api/projects/{project_id}/preview")
+def get_project_preview(project_id: str):
+    """Return the API path to open a local Next dev preview (redirect endpoint)."""
+    project = get_project(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if not project.get("output_dir"):
+        raise HTTPException(
+            status_code=404,
+            detail="No output_dir stored for this project",
+        )
+    return {"url": f"/output/{project_id}"}
+
+
+@app.get("/output/{project_id}")
+def open_output_preview(project_id: str):
+    """Redirect to a local `next dev` server for the project's generated folder."""
+    project = get_project(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    out = project.get("output_dir")
+    if not out:
+        raise HTTPException(
+            status_code=404,
+            detail="No output_dir stored for this project",
+        )
+    root = Path(out)
+    if not root.is_dir():
+        raise HTTPException(
+            status_code=404,
+            detail="Generated site folder is missing on disk",
+        )
+    try:
+        preview_url = ensure_preview_for_output_dir(str(root), API_PREVIEW_PORT)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except TimeoutError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    return RedirectResponse(url=f"{preview_url}/", status_code=307)
 
 
 @app.delete("/api/projects/{project_id}")

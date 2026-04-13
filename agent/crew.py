@@ -1,7 +1,6 @@
 """CrewAI pipeline: orchestrates agents through the generate -> test -> review loop."""
 
 import json
-import shutil
 import time
 import textwrap
 from typing import Callable
@@ -27,6 +26,7 @@ from agent.config import (
     ensure_dirs,
     get_llm,
 )
+from agent.fs_cleanup import reset_output_directory
 from agent.generator import materialize_site_from_raw
 from agent.planner import parse_plan, fallback_plan_from_prompt
 from agent.reviewer import check_thresholds, compute_score
@@ -44,9 +44,9 @@ def _load_prompt(name: str) -> str:
 
 
 def _clean_output():
-    if cfg.OUTPUT_DIR.exists():
-        shutil.rmtree(cfg.OUTPUT_DIR)
-    cfg.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    resolved = reset_output_directory(cfg.OUTPUT_DIR, stop_api_preview=True)
+    if resolved.resolve() != cfg.OUTPUT_DIR.resolve():
+        cfg.set_output_dir(resolved)
 
 
 def _kickoff_with_timeout(
@@ -119,6 +119,26 @@ def _kickoff_with_timeout(
 def _short(value: str, limit: int = 240) -> str:
     v = (value or "").strip().replace("\r", " ").replace("\n", " ")
     return textwrap.shorten(v, width=limit, placeholder="...")
+
+
+def _required_paths_from_plan(plan: dict) -> list[str]:
+    """Derive expected App Router file paths from plan pages (for developer checklist)."""
+    base = ["app/page.tsx", "app/layout.tsx", "app/globals.css"]
+    seen = set(base)
+    for page in plan.get("pages") or []:
+        if not isinstance(page, dict):
+            continue
+        route = str(page.get("route") or "/").strip() or "/"
+        if route in ("/", ""):
+            continue
+        parts = [seg for seg in route.strip("/").split("/") if seg]
+        if not parts:
+            continue
+        rel = "/".join(["app", *parts, "page.tsx"])
+        if rel not in seen:
+            seen.add(rel)
+            base.append(rel)
+    return base
 
 
 def _build_agents(llm):
@@ -197,7 +217,8 @@ def run_pipeline(
         wait_for_approval: Optional callback invoked before each major step starts.
 
     Returns:
-        dict with keys: url, scores, lighthouse, attempts, passed, time_seconds.
+        dict with keys: url, scores, lighthouse, attempts, passed, time_seconds,
+        output_dir (absolute path to the final generated site on disk).
     """
     ensure_dirs()
     llm = get_llm()
@@ -326,11 +347,6 @@ def run_pipeline(
         cfg.set_output_dir(attempt_output_dir)
         emit("attempt", "start", {"attempt": attempt, "max": MAX_RETRIES})
         emit(
-            "runtime",
-            "output_dir",
-            {"attempt": attempt, "path": str(cfg.OUTPUT_DIR)},
-        )
-        emit(
             "trace",
             "decision",
             {
@@ -345,13 +361,36 @@ def run_pipeline(
 
         # Step 2: Generate code
         _clean_output()
+        resolved_out = cfg.OUTPUT_DIR.resolve()
+        if resolved_out != attempt_output_dir.resolve():
+            emit(
+                "trace",
+                "result",
+                {
+                    "agent": "runtime",
+                    "decision": "output_dir_fallback",
+                    "reason": "output_cleanup_used_alternate_path",
+                    "planned_path": str(attempt_output_dir.resolve()),
+                    "actual_path": str(resolved_out),
+                    "attempt": attempt,
+                },
+            )
+        emit(
+            "runtime",
+            "output_dir",
+            {"attempt": attempt, "path": str(resolved_out)},
+        )
         ensure_not_stopped()
         require_approval("developer", {"attempt": attempt, "max": MAX_RETRIES})
         emit("developer", "running")
 
+        req_paths = _required_paths_from_plan(plan)
+        checklist = "\n".join(f"- `{p}`" for p in req_paths)
         dev_description = (
             f"Generate a complete Next.js 14 website based on this site plan:\n\n"
             f"{json.dumps(plan, indent=2)}\n\n"
+            f"Required file paths from this plan (include every one; use exact paths):\n"
+            f"{checklist}\n\n"
             f"After generating all the code, you MUST call the write_website_files tool "
             f"with your complete output to write the files to disk. "
             f"Then call the validate_build tool to run npm install and next build."
@@ -403,7 +442,6 @@ def run_pipeline(
                 f"Developer step timed out. Keep output concise and always call tools once. Error: {e}"
             )
             continue
-        emit("developer", "done", {"output": dev_result.raw[:500]})
         emit(
             "trace",
             "result",
@@ -413,10 +451,19 @@ def run_pipeline(
             },
         )
 
+        site_name = plan.get("site_name")
+        if site_name is not None and not isinstance(site_name, str):
+            site_name = str(site_name)
+        plan_style = plan.get("style") if isinstance(plan.get("style"), dict) else None
         try:
-            mat = materialize_site_from_raw(dev_result.raw or "", reset_output_dir=True)
+            mat = materialize_site_from_raw(
+                dev_result.raw or "",
+                reset_output_dir=True,
+                site_name=site_name,
+                plan_style=plan_style,
+            )
         except ValueError as e:
-            emit("developer", "materialize_failed", {"error": str(e)})
+            emit("developer", "failed", {"error": str(e)})
             emit(
                 "trace",
                 "result",
@@ -435,6 +482,16 @@ def run_pipeline(
             continue
 
         paths_preview = mat["paths"][:12] if isinstance(mat.get("paths"), list) else []
+        stub_paths = mat.get("stub_paths") or []
+        if stub_paths:
+            emit(
+                "trace",
+                "result",
+                {
+                    "agent": "developer",
+                    "stub_files_added": [str(p) for p in stub_paths],
+                },
+            )
         emit(
             "trace",
             "result",
@@ -443,6 +500,15 @@ def run_pipeline(
                 "materialized_from_raw": True,
                 "files_written": mat.get("files_written", 0),
                 "paths_preview": [str(p) for p in paths_preview],
+            },
+        )
+        emit(
+            "developer",
+            "done",
+            {
+                "files_written": mat.get("files_written", 0),
+                "stub_files_added": stub_paths,
+                "output_preview": _short(dev_result.raw, 500),
             },
         )
 
@@ -781,4 +847,5 @@ def run_pipeline(
         "attempts": attempt,
         "passed": review_result.get("passed", False),
         "time_seconds": elapsed,
+        "output_dir": str(cfg.OUTPUT_DIR.resolve()),
     }

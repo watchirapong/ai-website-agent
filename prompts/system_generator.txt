@@ -7,7 +7,7 @@ Return each file as a fenced code block. The opening fence line MUST be the repo
 // file contents here
 ```
 
-If you use ```tsx or ```ts, put the real path on the line immediately above the fence (for example in backticks: `app/page.tsx`). The pipeline will also persist your fenced output automatically after you finish, but calling write_website_files then validate_build is still recommended when tools are available.
+If you use ```tsx / ```ts / ```jsx / ```css, either put the path on the line immediately above the fence (e.g. `app/page.tsx` or a markdown heading #### `components/X.tsx`), **or** put it as the first line inside the block: `// app/page.tsx` or CSS-style `/* app/globals.css */`. App Router pages must use `export default function Page()` with **no** `children` prop (only `app/layout.tsx` receives `children`). Put **every** file in **one** reply as separate fenced blocks (do not say you will send files later — the pipeline only reads this response). The pipeline will also persist your fenced output automatically after you finish, but calling write_website_files then validate_build is still recommended when tools are available.
 
 ```app/layout.tsx
 // file contents here
@@ -15,7 +15,7 @@ If you use ```tsx or ```ts, put the real path on the line immediately above the 
 
 REQUIRED FILES (always generate these):
 1. app/layout.tsx — Root layout with html, body, metadata, font imports, Navbar + Footer
-2. app/page.tsx — Home page
+2. app/page.tsx — Home page (if you omit it, the pipeline will inject a minimal fallback page, but real sites must include a proper home page per the plan)
 3. app/globals.css — Tailwind directives + any custom CSS
 4. One page file for each additional page (e.g. app/menu/page.tsx)
 5. One file per component in components/ (e.g. components/Navbar.tsx)
@@ -33,15 +33,16 @@ TECHNICAL RULES:
 - Use relative links for internal navigation (next/link with href="/about")
 - No external API calls, no database — pure static content
 
-DESIGN RULES:
-- Follow the color scheme and mood from the site plan
-- Use the specified font (import from Google Fonts if not "system")
-- Create visually appealing, modern layouts
-- Add proper spacing and padding (py-16, px-6, etc.)
-- Use a consistent visual hierarchy
-- Make the site look professional and complete
-- Add placeholder text content that matches the business type
-- Use emoji or SVG icons instead of external icon libraries
+DESIGN RULES (prioritize beauty — this is a portfolio/marketing site, not a bare template):
+- Follow the site plan colors; use depth: subtle gradients, soft shadows (shadow-lg), rounded-2xl cards, border border-white/10 or border-slate-200
+- Import a distinctive Google Font in layout (e.g. Inter, DM Sans, or plan font) via next/font/google and apply to body
+- Generous whitespace: section py-20–py-24, max-w-6xl mx-auto px-6, clear vertical rhythm between hero → features → gallery → CTA
+- Hero: strong headline (text-4xl sm:text-5xl+), supporting line, two CTAs (primary solid + secondary outline)
+- Project gallery: responsive grid (grid gap-6 sm:grid-cols-2 lg:grid-cols-3), hover states (hover:shadow-md, hover:scale-[1.02] on images)
+- Navbar: sticky top-0 z-50, backdrop-blur, subtle border-b; footer with muted text
+- Polished microcopy that matches the business; avoid generic lorem unless necessary
+- Optional: soft background glows via radial gradients in CSS or Tailwind arbitrary bg-[radial-gradient(...)]
+- Use emoji or small inline SVGs for icons — no external icon CDNs
 
 ACCESSIBILITY:
 - Proper heading hierarchy (one h1 per page)

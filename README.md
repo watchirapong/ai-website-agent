@@ -408,9 +408,12 @@ data: {"step": "deployer", "status": "done", "url": "https://coffee.vercel.app"}
 
 | Port | Service |
 |------|---------|
-| `3000` | Generated website preview (next start) |
+| `3000` | Generated website preview (next start, in-pipeline / agent tester) |
+| `3040` | Local preview from the API (`GET /output/{project_id}` → `next dev`; override with `API_PREVIEW_PORT`) |
 | `3001` | Dashboard web UI (Next.js) |
-| `8000` | Backend API (FastAPI) |
+| `8000` | Backend API (FastAPI; examples often use `8020`) |
+
+After a successful run, the dashboard **Open preview** link hits the API, which may start `next dev` for the stored `output_dir` and **redirects the browser to `http://127.0.0.1:{API_PREVIEW_PORT}/`**. That only works when the browser and backend run on the same machine (it is not a full remote reverse proxy).
 
 ---
 
@@ -793,6 +796,17 @@ VIEWPORTS = {
 # Database
 DATABASE_PATH = "projects.db"
 ```
+
+### Windows: `WinError 5` / `next-swc` file locks
+
+If the pipeline reports **Access is denied** on a path like `output_attempt_1\node_modules\@next\swc-win32-x64-msvc\next-swc.win32-x64-msvc.node`, a `node.exe` process (often `next dev` or the dashboard preview) still has that folder open.
+
+1. **Stop** any local preview or dev server using the generated output (close browser tabs, stop terminals running `npm run dev` / `next dev` under `output_attempt_*`).
+2. **Restart the FastAPI backend** after updating the project so it loads the latest cleanup logic in `agent/fs_cleanup.py`.
+
+The agent tries to stop the API preview subprocess, kill matching `node.exe` processes, then delete or quarantine the output tree. If the folder is still locked, it continues in a sibling directory named `output_attempt_N__fresh_<timestamp>` and updates the active output path; check logs for warnings.
+
+**Optional (aggressive):** in `.env`, set `AGENT_WINDOWS_KILL_ALL_NODE=1` to run `taskkill /F /IM node.exe` before clearing output. This closes **every** Node process on the machine—not only the one holding the lock. See `.env.example`.
 
 ---
 

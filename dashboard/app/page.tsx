@@ -489,6 +489,14 @@ export default function HomePage() {
     return null;
   })();
 
+  const pipelineComplete = events.some(
+    (e) => e.step === "pipeline" && e.status === "complete"
+  );
+  const localPreviewUrl =
+    projectId && !isRunning && pipelineComplete
+      ? `${API_URL}/output/${projectId}`
+      : null;
+
   const logLines = useMemo(
     () =>
       events.map((e) => formatEventLine(e)),
@@ -595,6 +603,27 @@ export default function HomePage() {
       <section>
         <ScreenshotGrid projectId={projectId} show={!!latestLighthouse} />
       </section>
+
+      {localPreviewUrl && (
+        <section className="rounded-xl border border-blue-800 bg-blue-950/40 p-6">
+          <h2 className="mb-2 text-lg font-semibold text-blue-300">
+            Open preview (local)
+          </h2>
+          <p className="mb-3 text-sm text-blue-100/90">
+            Starts or reuses <code className="rounded bg-blue-900/80 px-1">next dev</code> on
+            this machine and redirects your browser to{" "}
+            <code className="rounded bg-blue-900/80 px-1">127.0.0.1</code> (same PC as the API).
+          </p>
+          <a
+            href={localPreviewUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-block rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-blue-500"
+          >
+            Open preview
+          </a>
+        </section>
+      )}
 
       {deployedUrl && (
         <section className="rounded-xl border border-green-800 bg-green-950/40 p-6">

@@ -40,9 +40,10 @@ function getStepStatus(
   for (const e of events) {
     if (e.step === stepKey) {
       if (e.status === "waiting_approval") latest = "waiting";
-      else if (e.status === "running") latest = "running";
+      else       if (e.status === "running") latest = "running";
       else if (e.status === "done") latest = "done";
-      else if (e.status === "failed") latest = "failed";
+      else if (e.status === "failed" || e.status === "materialize_failed")
+        latest = "failed";
     }
   }
   const end = pipelineEnded(events);
@@ -66,7 +67,13 @@ function getStepDetail(stepKey: string, events: PipelineEvent[]): string {
       }
     }
     if (stepKey === "developer" && e.status === "done") {
-      return `${e.detail?.count || 0} files generated`;
+      const fw = e.detail?.files_written;
+      const cnt =
+        typeof fw === "number" ? fw : Number(e.detail?.count) || 0;
+      const stubs = e.detail?.stub_files_added as unknown[] | undefined;
+      const stubPart =
+        stubs && stubs.length > 0 ? ` (${stubs.length} placeholder)` : "";
+      return `${cnt} files written${stubPart}`;
     }
     if (stepKey === "build" && e.status === "done") {
       return "Build passed";

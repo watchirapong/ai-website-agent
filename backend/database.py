@@ -28,6 +28,11 @@ CREATE TABLE IF NOT EXISTS projects (
 def init_db():
     conn = sqlite3.connect(str(DATABASE_PATH))
     conn.execute(_CREATE_TABLE)
+    try:
+        conn.execute("ALTER TABLE projects ADD COLUMN output_dir TEXT")
+    except sqlite3.OperationalError as e:
+        if "duplicate column" not in str(e).lower():
+            raise
     conn.commit()
     conn.close()
 
