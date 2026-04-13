@@ -1,24 +1,21 @@
-"""Agent 2 — Next.js Developer: generates a complete Next.js app from a site plan."""
+"""Agent 2 — Next.js Developer: file parsing and writing utilities.
+
+LLM interaction is handled by CrewAI. This module provides post-processing
+for the developer agent's output: parsing code blocks, writing files to disk,
+and ensuring required configs exist.
+"""
 
 import json
 import re
-from pathlib import Path
 
-import ollama as ollama_client
-from agent.config import OLLAMA_MODEL, OLLAMA_BASE_URL, OUTPUT_DIR, PROMPTS_DIR
+from agent.config import OUTPUT_DIR
 
 
-def _load_system_prompt() -> str:
-    path = PROMPTS_DIR / "system_generator.txt"
-    return path.read_text()
+def parse_files_from_response(raw: str) -> dict[str, str]:
+    """Extract file path -> content pairs from LLM response.
 
-
-def _parse_files_from_response(raw: str) -> dict[str, str]:
-    """Extract file path → content pairs from LLM response.
-
-    Expects ```filepath\ncontent\n``` blocks or a JSON dict.
+    Expects ```filepath\\ncontent\\n``` blocks or a JSON dict.
     """
-    # Try JSON first
     try:
         data = json.loads(raw)
         if isinstance(data, dict) and "files" in data:
@@ -28,13 +25,11 @@ def _parse_files_from_response(raw: str) -> dict[str, str]:
     except (json.JSONDecodeError, ValueError):
         pass
 
-    # Fall back to fenced code blocks: ```path/to/file\n...```
     files: dict[str, str] = {}
     pattern = r"```(\S+)\n(.*?)```"
     for match in re.finditer(pattern, raw, re.DOTALL):
         filepath = match.group(1)
         content = match.group(2).strip()
-        # Skip blocks that look like language tags rather than paths
         if "/" in filepath or filepath.endswith((".tsx", ".ts", ".css", ".js", ".json")):
             files[filepath] = content
 
@@ -44,7 +39,7 @@ def _parse_files_from_response(raw: str) -> dict[str, str]:
     return files
 
 
-def _write_files(files: dict[str, str]) -> list[str]:
+def write_files(files: dict[str, str]) -> list[str]:
     """Write generated files to OUTPUT_DIR. Returns list of written paths."""
     written: list[str] = []
     for rel_path, content in files.items():
@@ -55,7 +50,7 @@ def _write_files(files: dict[str, str]) -> list[str]:
     return written
 
 
-def _ensure_package_json(files: dict[str, str]) -> dict[str, str]:
+def ensure_package_json(files: dict[str, str]) -> dict[str, str]:
     """Add a default package.json if the LLM didn't generate one."""
     if "package.json" in files:
         return files
@@ -89,7 +84,7 @@ def _ensure_package_json(files: dict[str, str]) -> dict[str, str]:
     return files
 
 
-def _ensure_configs(files: dict[str, str]) -> dict[str, str]:
+def ensure_configs(files: dict[str, str]) -> dict[str, str]:
     """Add boilerplate configs if not generated."""
     if "next.config.js" not in files:
         files["next.config.js"] = "/** @type {import('next').NextConfig} */\nconst nextConfig = {}\n\nmodule.exports = nextConfig\n"
@@ -144,37 +139,3 @@ def _ensure_configs(files: dict[str, str]) -> dict[str, str]:
         files["app/globals.css"] = "@tailwind base;\n@tailwind components;\n@tailwind utilities;\n"
 
     return files
-
-
-def generate_site(plan: dict, fix_instructions: str | None = None) -> list[str]:
-    """Generate a Next.js website from a site plan.
-
-    Args:
-        plan: Structured site plan from the Planner agent.
-        fix_instructions: Optional feedback from a previous review cycle.
-
-    Returns:
-        List of file paths that were written to OUTPUT_DIR.
-    """
-    system_prompt = _load_system_prompt()
-
-    user_message = f"Site plan:\n{json.dumps(plan, indent=2)}"
-    if fix_instructions:
-        user_message += f"\n\nPREVIOUS REVIEW FEEDBACK — fix these issues:\n{fix_instructions}"
-
-    client = ollama_client.Client(host=OLLAMA_BASE_URL)
-    response = client.chat(
-        model=OLLAMA_MODEL,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message},
-        ],
-    )
-
-    raw = response["message"]["content"]
-    files = _parse_files_from_response(raw)
-    files = _ensure_package_json(files)
-    files = _ensure_configs(files)
-
-    written = _write_files(files)
-    return written

@@ -15,14 +15,21 @@ from sse_starlette.sse import EventSourceResponse
 
 from backend.database import init_db, create_project, update_project, get_project, list_projects, delete_project
 from backend.events import event_manager
+from backend.pipeline_logging import pipeline_log_context
 from agent.crew import run_pipeline
 from agent.config import REPORTS_DIR, SCREENSHOTS_DIR
 
 app = FastAPI(title="AI Website Agent", version="1.0.0")
 
+# EventSource from localhost:3001 is cross-origin; ``credentials=True`` + ``origins=["*"]`` is invalid CORS.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:3001",
+        "http://127.0.0.1:3001",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -73,11 +80,12 @@ def start_generation(req: GenerateRequest):
                 )
 
         try:
-            result = run_pipeline(
-                user_prompt=req.prompt,
-                on_event=on_event,
-                skip_deploy=req.skip_deploy,
-            )
+            with pipeline_log_context(project_id):
+                result = run_pipeline(
+                    user_prompt=req.prompt,
+                    on_event=on_event,
+                    skip_deploy=req.skip_deploy,
+                )
             update_project(
                 project_id,
                 status="completed",

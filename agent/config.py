@@ -3,9 +3,19 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(BASE_DIR / ".env")
+except ImportError:
+    pass
+
 # --- LLM ---
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3")
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+LLM_MODEL = os.getenv("LLM_MODEL", "claude-sonnet-4-20250514")
+ANTHROPIC_API_KEY = (os.getenv("ANTHROPIC_API_KEY") or "").strip()
+if ANTHROPIC_API_KEY:
+    # CrewAI's Anthropic client treats api_key="" as "set" and skips reading ANTHROPIC_API_KEY from the env.
+    os.environ["ANTHROPIC_API_KEY"] = ANTHROPIC_API_KEY
 
 # --- Ports ---
 DASHBOARD_PORT = int(os.getenv("DASHBOARD_PORT", "3001"))
@@ -45,3 +55,13 @@ def ensure_dirs():
     """Create required directories if they don't exist."""
     for d in (OUTPUT_DIR, REPORTS_DIR, SCREENSHOTS_DIR):
         d.mkdir(parents=True, exist_ok=True)
+
+
+def get_llm():
+    """Return a CrewAI LLM instance."""
+    from crewai import LLM
+    return LLM(
+        model=f"anthropic/{LLM_MODEL}",
+        # Must be None if unset — empty string breaks CrewAI (it won't fall back to ANTHROPIC_API_KEY).
+        api_key=ANTHROPIC_API_KEY or None,
+    )

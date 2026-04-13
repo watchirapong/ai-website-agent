@@ -1,38 +1,24 @@
-"""Agent 1 — Website Architect: parses user prompt into a structured site plan."""
+"""Agent 1 — Website Architect: JSON plan parsing and validation utilities.
+
+LLM interaction is handled by CrewAI. This module provides post-processing
+for the planner agent's output.
+"""
 
 import json
-import ollama as ollama_client
-from agent.config import OLLAMA_MODEL, OLLAMA_BASE_URL, PROMPTS_DIR
 
 
-def _load_system_prompt() -> str:
-    path = PROMPTS_DIR / "system_planner.txt"
-    return path.read_text()
+def parse_plan(raw: str) -> dict:
+    """Parse raw LLM output into a structured site plan dict.
 
-
-def plan_site(user_prompt: str) -> dict:
-    """Convert a free-form user prompt into a structured site plan.
-
-    Returns a dict with keys: site_name, pages, components, style, features.
+    Returns a dict with keys: site_name, pages, components, style.
     """
-    system_prompt = _load_system_prompt()
-
-    client = ollama_client.Client(host=OLLAMA_BASE_URL)
-    response = client.chat(
-        model=OLLAMA_MODEL,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        format="json",
-    )
-
-    raw = response["message"]["content"]
     try:
         plan = json.loads(raw)
     except json.JSONDecodeError:
         start = raw.find("{")
         end = raw.rfind("}") + 1
+        if start == -1 or end == 0:
+            raise ValueError("No JSON object found in planner output")
         plan = json.loads(raw[start:end])
 
     required = ["site_name", "pages", "components", "style"]

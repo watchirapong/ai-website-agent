@@ -201,9 +201,10 @@ A Next.js web UI to manage and prompt the agent from the browser.
 │  └────────────────────────────┘                              │
 │                                                              │
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐                   │
-│  │ Ollama   │  │Playwright│  │Lighthouse│                   │
-│  │ :11434   │  │ Chromium │  │ CLI      │                   │
-│  └──────────┘  └──────────┘  └──────────┘                   │
+│  ┌──────────┐  ┌──────────┐                                 │
+│  │Playwright│  │Lighthouse│                                 │
+│  │ Chromium │  │ CLI      │                                 │
+│  └──────────┘  └──────────┘                                 │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -383,7 +384,7 @@ data: {"step": "deployer", "status": "done", "url": "https://coffee.vercel.app"}
 | **Database** | SQLite | Project history, scores, URLs |
 | **Agent Framework** | CrewAI | Orchestrates multi-agent pipeline |
 | **Language** | Python 3.11+ | Agent and backend runtime |
-| **LLM** | Ollama + llama3 | 100% local AI, no API keys |
+| **LLM** | Anthropic Claude | Cloud AI via API |
 | **Website Output** | Next.js 14 + React 18 | Generated website framework |
 | **Styling** | Tailwind CSS | Utility-first CSS for generated sites |
 | **Type Safety** | TypeScript | Catches errors at build time |
@@ -397,8 +398,7 @@ data: {"step": "deployer", "status": "done", "url": "https://coffee.vercel.app"}
 - **Next.js Dashboard** — Same framework as the generated sites, fast to build, great DX
 - **FastAPI** — Async Python, native SSE support, lightweight, fast
 - **SQLite** — Zero-config database, no extra server needed, local-first
-- **CrewAI** — Clean agent-per-role design, built-in task chaining, supports Ollama
-- **Ollama** — Runs locally, no API keys, no cost, no rate limits
+- **CrewAI** — Clean agent-per-role design, built-in task chaining
 - **Next.js Output** — AI generates small focused components instead of one giant HTML file
 - **Tailwind** — AI writes utility classes instead of inventing CSS (fewer bugs)
 - **TypeScript** — Build step catches errors before the site ever runs
@@ -411,7 +411,6 @@ data: {"step": "deployer", "status": "done", "url": "https://coffee.vercel.app"}
 | `3000` | Generated website preview (next start) |
 | `3001` | Dashboard web UI (Next.js) |
 | `8000` | Backend API (FastAPI) |
-| `11434` | Ollama LLM server |
 
 ---
 
@@ -597,7 +596,6 @@ ai-website-agent/
 | Python | 3.11+ | Agent + backend runtime |
 | Node.js | 18+ | Next.js dashboard + Lighthouse |
 | npm | 9+ | Package management |
-| Ollama | latest | Local LLM runtime |
 
 ---
 
@@ -609,20 +607,13 @@ ai-website-agent/
 cd ai-website-agent
 ```
 
-### 2. Install Ollama and pull a model
-
-```bash
-curl -fsSL https://ollama.com/install.sh | sh
-ollama pull llama3
-```
-
-### 3. Install Node.js tools
+### 2. Install Node.js tools
 
 ```bash
 npm install -g vercel lighthouse
 ```
 
-### 4. Install Python dependencies
+### 3. Install Python dependencies
 
 ```bash
 python -m venv venv
@@ -630,13 +621,13 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 5. Install Playwright browser
+### 4. Install Playwright browser
 
 ```bash
 playwright install chromium
 ```
 
-### 6. Install Dashboard dependencies
+### 5. Install Dashboard dependencies
 
 ```bash
 cd dashboard
@@ -649,7 +640,6 @@ cd ..
 ```
 crewai>=0.80.0
 crewai-tools>=0.14.0
-ollama>=0.4.7
 playwright>=1.49.1
 beautifulsoup4>=4.12.3
 requests>=2.32.3
@@ -664,7 +654,7 @@ sse-starlette>=2.1.0
 
 ## Usage
 
-### Start the system (3 terminals)
+### Start the system (2 terminals)
 
 ```bash
 # Terminal 1 — Backend API
@@ -674,9 +664,6 @@ uvicorn main:app --port 8000 --reload
 # Terminal 2 — Dashboard UI
 cd dashboard
 npm run dev -- --port 3001
-
-# Terminal 3 — Ollama (if not running as service)
-ollama serve
 ```
 
 ### Open the dashboard
@@ -704,8 +691,6 @@ python main.py "build a portfolio site" --no-deploy
 # Set max retry attempts
 python main.py "build a restaurant site" --max-retries 5
 
-# Use a different model
-python main.py "build a blog" --model codellama
 ```
 
 ### Example CLI Output
@@ -754,8 +739,8 @@ Edit `agent/config.py` to customize:
 
 ```python
 # LLM
-OLLAMA_MODEL = "llama3"
-OLLAMA_BASE_URL = "http://localhost:11434"
+LLM_MODEL = "claude-haiku-4-20250414"
+ANTHROPIC_API_KEY = "your-api-key"
 
 # Ports
 DASHBOARD_PORT = 3001

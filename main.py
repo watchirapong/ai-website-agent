@@ -91,15 +91,12 @@ def main():
     parser.add_argument("prompt", help="Describe the website you want to build")
     parser.add_argument("--no-deploy", action="store_true", help="Skip deployment")
     parser.add_argument("--max-retries", type=int, default=None, help="Max retry attempts")
-    parser.add_argument("--model", type=str, default=None, help="Ollama model name")
     parser.add_argument("--port", type=int, default=None, help="Preview server port")
 
     args = parser.parse_args()
 
     if args.max_retries is not None:
         config.MAX_RETRIES = args.max_retries
-    if args.model is not None:
-        config.OLLAMA_MODEL = args.model
     if args.port is not None:
         config.PREVIEW_PORT = args.port
 

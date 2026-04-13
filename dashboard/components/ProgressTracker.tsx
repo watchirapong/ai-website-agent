@@ -20,6 +20,16 @@ const STEPS = [
   { key: "deployer", label: "Deployer", icon: "7" },
 ];
 
+function pipelineEnded(events: PipelineEvent[]): "running" | "ok" | "failed" {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i];
+    if (e.step !== "pipeline") continue;
+    if (e.status === "complete") return "ok";
+    if (e.status === "failed") return "failed";
+  }
+  return "running";
+}
+
 function getStepStatus(
   stepKey: string,
   events: PipelineEvent[]
@@ -31,6 +41,10 @@ function getStepStatus(
       else if (e.status === "done") latest = "done";
       else if (e.status === "failed") latest = "failed";
     }
+  }
+  const end = pipelineEnded(events);
+  if (end === "failed" && latest === "running") {
+    return "failed";
   }
   return latest as "pending" | "running" | "done" | "failed";
 }

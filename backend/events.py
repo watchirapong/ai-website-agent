@@ -4,13 +4,19 @@ import asyncio
 import json
 from collections import defaultdict
 
+# Pipeline runs in a worker thread; emit() must not call asyncio.Queue.put_nowait
+# from that thread — use the event loop's thread-safe scheduler instead.
+
 
 class EventManager:
     """Manages Server-Sent Events for real-time progress streaming."""
 
     def __init__(self):
         self._events: dict[str, list[dict]] = defaultdict(list)
-        self._subscribers: dict[str, list[asyncio.Queue]] = defaultdict(list)
+        # Each subscriber: (asyncio loop that owns the queue, asyncio.Queue)
+        self._subscribers: dict[str, list[tuple[asyncio.AbstractEventLoop, asyncio.Queue]]] = (
+            defaultdict(list)
+        )
 
     def emit(self, project_id: str, step: str, status: str, detail: dict | None = None):
         """Emit a progress event for a project."""
@@ -21,8 +27,13 @@ class EventManager:
         }
         self._events[project_id].append(event)
 
-        for queue in self._subscribers.get(project_id, []):
-            queue.put_nowait(event)
+        for loop, queue in self._subscribers.get(project_id, []):
+            loop.call_soon_threadsafe(queue.put_nowait, event)
+
+    @staticmethod
+    def _sse_chunk(event: dict) -> dict:
+        """Format for sse_starlette.EventSourceResponse (do not pre-prefix ``data:``)."""
+        return {"data": json.dumps(event, default=str)}
 
     def get_events(self, project_id: str) -> list[dict]:
         """Get all events emitted for a project."""
@@ -30,24 +41,36 @@ class EventManager:
 
     async def subscribe(self, project_id: str):
         """Async generator that yields SSE-formatted events."""
+        loop = asyncio.get_running_loop()
         queue: asyncio.Queue = asyncio.Queue()
-        self._subscribers[project_id].append(queue)
+        sub = (loop, queue)
+        self._subscribers[project_id].append(sub)
 
-        # Send all past events first
+        # Yield dicts for sse_starlette — it wraps with ServerSentEvent (adds ``data:``).
+        # Pre-formatted ``data: ...\\n\\n`` strings get double-wrapped and break EventSource.
         for event in self._events.get(project_id, []):
-            yield f"event: {event['step']}\ndata: {json.dumps(event)}\n\n"
+            yield self._sse_chunk(event)
 
         try:
             while True:
                 event = await asyncio.wait_for(queue.get(), timeout=300)
-                yield f"event: {event['step']}\ndata: {json.dumps(event)}\n\n"
+                yield self._sse_chunk(event)
 
                 if event.get("step") in ("deployer", "pipeline") and event.get("status") in ("done", "failed", "complete"):
                     break
         except asyncio.TimeoutError:
-            yield "event: timeout\ndata: {}\n\n"
+            yield self._sse_chunk(
+                {
+                    "step": "pipeline",
+                    "status": "failed",
+                    "detail": {"error": "SSE stream timeout"},
+                }
+            )
         finally:
-            self._subscribers[project_id].remove(queue)
+            try:
+                self._subscribers[project_id].remove(sub)
+            except ValueError:
+                pass
 
     def clear(self, project_id: str):
         """Clear events for a project."""

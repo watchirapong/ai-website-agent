@@ -1,6 +1,5 @@
 crewai>=0.80.0
 crewai-tools>=0.14.0
-ollama>=0.4.7
 playwright>=1.49.1
 beautifulsoup4>=4.12.3
 requests>=2.32.3
@@ -10,3 +9,4 @@ uvicorn>=0.34.0
 aiosqlite>=0.20.0
 sse-starlette>=2.1.0
 pydantic>=2.9.0
+python-dotenv>=1.0.0
