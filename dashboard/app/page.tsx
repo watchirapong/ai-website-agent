@@ -27,7 +27,12 @@ interface StatusResponse {
   events?: PipelineEvent[];
 }
 
-type StreamMode = "stream" | "polling" | "idle";
+type StreamMode =
+  | "stream"
+  | "polling"
+  | "idle"
+  | "connecting"
+  | "cancelling";
 
 function normalizeEvents(raw: PipelineEvent[]): PipelineEvent[] {
   return raw.map((e) => ({
@@ -159,6 +164,25 @@ export default function HomePage() {
   const [approvingStep, setApprovingStep] = useState<string | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const closeStreamRef = useRef<(() => void) | null>(null);
+  /** When status is `stopping`, track how long — auto-clear if server never finishes */
+  const stoppingSinceRef = useRef<number | null>(null);
+
+  const handleStartOver = () => {
+    sessionStorage.removeItem(STORAGE_KEY);
+    if (pollRef.current) {
+      clearInterval(pollRef.current);
+      pollRef.current = null;
+    }
+    (closeStreamRef.current as (() => void) | null)?.();
+    closeStreamRef.current = null;
+    stoppingSinceRef.current = null;
+    setProjectId(null);
+    setEvents([]);
+    setResult(null);
+    setError(null);
+    setIsRunning(false);
+    setStreamMode("idle");
+  };
 
   /** After refresh: reload events from API (in-memory on server) or poll until the run ends */
   useEffect(() => {
@@ -174,6 +198,7 @@ export default function HomePage() {
       setProjectId(id);
       setEvents((prev) => mergeEventsBySeq(prev, evs));
       if (isTerminalStatus(data.status)) {
+        stoppingSinceRef.current = null;
         setResult({
           error: data.status === "failed" ? data.error || "Pipeline failed" : null,
           attempts: data.attempts || 0,
@@ -185,6 +210,7 @@ export default function HomePage() {
         return true;
       }
       if (isTerminalPipeline(evs)) {
+        stoppingSinceRef.current = null;
         const last = [...evs].reverse().find((e) => e.step === "pipeline");
         if (last) setResult(last.detail as Record<string, unknown>);
         setIsRunning(false);
@@ -192,6 +218,30 @@ export default function HomePage() {
         sessionStorage.removeItem(STORAGE_KEY);
         return true;
       }
+      if (data.status === "stopping") {
+        if (stoppingSinceRef.current === null) stoppingSinceRef.current = Date.now();
+        const elapsed = Date.now() - stoppingSinceRef.current;
+        if (elapsed > 45_000) {
+          stoppingSinceRef.current = null;
+          sessionStorage.removeItem(STORAGE_KEY);
+          setIsRunning(false);
+          setStreamMode("idle");
+          setProjectId(null);
+          setEvents([]);
+          setError(
+            "Previous job stayed in “stopping” too long — session cleared. You can generate again."
+          );
+          if (pollRef.current) {
+            clearInterval(pollRef.current);
+            pollRef.current = null;
+          }
+          return true;
+        }
+        setIsRunning(false);
+        setStreamMode("cancelling");
+        return false;
+      }
+      stoppingSinceRef.current = null;
       setIsRunning(true);
       return false;
     };
@@ -245,7 +295,7 @@ export default function HomePage() {
     setEvents([]);
     setResult(null);
     setError(null);
-    setStreamMode("idle");
+    setStreamMode("connecting");
     setApprovingStep(null);
     setIsRunning(true);
 
@@ -381,14 +431,18 @@ export default function HomePage() {
   };
 
   const handleStop = async () => {
-    if (!projectId || !isRunning) return;
+    if (!projectId) return;
     try {
       const res = await fetch(`${API_URL}/api/stop/${projectId}`, { method: "POST" });
       if (!res.ok) {
         const text = await res.text();
         throw new Error(text || `HTTP ${res.status}`);
       }
-      setError("Stop requested. Waiting for pipeline to end...");
+      setStreamMode("cancelling");
+      setIsRunning(false);
+      setError(
+        "Stop sent. You can start a new generate below; the old run will finish cancelling on the server."
+      );
     } catch (e) {
       setError(`Stop request failed: ${toErrorMessage(e, "unknown error")}`);
     }
@@ -456,9 +510,30 @@ export default function HomePage() {
           automatically.
         </p>
         <PromptInput onSubmit={handleGenerate} onStop={handleStop} isLoading={isRunning} />
-        {isRunning && (
+        {(isRunning || streamMode === "cancelling") && (
           <p className="mt-2 text-xs text-gray-500">
-            Connection mode: {streamMode === "stream" ? "live stream" : streamMode === "polling" ? "HTTP polling fallback" : "starting"}
+            Connection mode:{" "}
+            {streamMode === "cancelling"
+              ? "stop requested — you can generate again below; old run ends in the background"
+              : streamMode === "connecting"
+                ? "connecting…"
+                : streamMode === "stream"
+                  ? "live stream"
+                  : streamMode === "polling"
+                    ? "HTTP polling fallback"
+                    : "idle"}
+          </p>
+        )}
+        {projectId && !isRunning && (
+          <p className="mt-2 text-xs text-gray-500">
+            <button
+              type="button"
+              onClick={handleStartOver}
+              className="text-blue-400 underline decoration-blue-400/50 hover:text-blue-300"
+            >
+              Clear session / reset form
+            </button>
+            <span className="text-gray-600"> — if the UI looks stuck after a stop or refresh</span>
           </p>
         )}
         <p className="mt-4 text-xs text-gray-500">

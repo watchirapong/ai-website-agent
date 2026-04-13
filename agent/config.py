@@ -36,6 +36,10 @@ DASHBOARD_PORT = int(os.getenv("DASHBOARD_PORT", "3001"))
 BACKEND_PORT = int(os.getenv("BACKEND_PORT", "8000"))
 PREVIEW_PORT = int(os.getenv("PREVIEW_PORT", "3000"))
 
+# Deploy: "local" = `next start` bound to 127.0.0.1 only (this machine). "vercel" = public Vercel deploy.
+_deploy_target = os.getenv("DEPLOY_TARGET", "local").strip().lower()
+DEPLOY_TARGET = _deploy_target if _deploy_target in {"local", "vercel"} else "local"
+
 # --- Paths ---
 BASE_OUTPUT_DIR = BASE_DIR / "output"
 OUTPUT_DIR = BASE_OUTPUT_DIR

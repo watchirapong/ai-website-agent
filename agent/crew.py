@@ -54,8 +54,11 @@ def _kickoff_with_timeout(
     step_name: str,
     timeout_seconds: int = PIPELINE_STEP_TIMEOUT_SECONDS,
     on_empty_retry: Callable[[dict], None] | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ):
     """Run crew kickoff with a hard timeout to avoid indefinite hangs.
+
+    Polls ``should_stop`` every ~2s so Stop can interrupt a long LLM call.
 
     Important: we intentionally do not block executor shutdown on timeout. CrewAI
     may keep provider calls alive; waiting for thread join here can freeze the
@@ -65,12 +68,21 @@ def _kickoff_with_timeout(
         executor = ThreadPoolExecutor(max_workers=1)
         future = executor.submit(crew.kickoff)
         try:
-            result = future.result(timeout=timeout_seconds)
-        except FuturesTimeoutError as e:
-            future.cancel()
-            raise TimeoutError(
-                f"{step_name} timed out after {timeout_seconds}s"
-            ) from e
+            deadline = time.time() + timeout_seconds
+            result = None
+            while True:
+                if should_stop and should_stop():
+                    raise RuntimeError("Cancelled by user")
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"{step_name} timed out after {timeout_seconds}s"
+                    )
+                try:
+                    result = future.result(timeout=min(2.0, remaining))
+                    break
+                except FuturesTimeoutError:
+                    continue
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
 
@@ -90,7 +102,11 @@ def _kickoff_with_timeout(
                         "sleep_seconds": backoff,
                     }
                 )
-            time.sleep(backoff)
+            end_sleep = time.time() + backoff
+            while time.time() < end_sleep:
+                if should_stop and should_stop():
+                    raise RuntimeError("Cancelled by user")
+                time.sleep(min(0.25, end_sleep - time.time()))
             continue
 
         raise RuntimeError(
@@ -252,6 +268,7 @@ def run_pipeline(
                     **info,
                 },
             ),
+            should_stop=should_stop,
         )
         emit(
             "trace",
@@ -373,6 +390,7 @@ def run_pipeline(
                         **info,
                     },
                 ),
+                should_stop=should_stop,
             )
         except TimeoutError as e:
             emit("developer", "failed", {"error": str(e)})
@@ -513,6 +531,7 @@ def run_pipeline(
                             **info,
                         },
                     ),
+                    should_stop=should_stop,
                 )
             except TimeoutError as e:
                 emit("tester", "failed", {"error": str(e)})
@@ -643,6 +662,7 @@ def run_pipeline(
                         **info,
                     },
                 ),
+                should_stop=should_stop,
             )
             fix_instructions = review_crew_result.raw
 
@@ -680,55 +700,76 @@ def run_pipeline(
     deployed_url = None
     if not skip_deploy:
         ensure_not_stopped()
+        local_deploy = cfg.DEPLOY_TARGET == "local"
         emit(
             "trace",
             "decision",
             {
                 "agent": "deployer",
-                "why": "Deploy only after review passes and skip_deploy is false.",
+                "why": (
+                    "Serve the site on this machine only (127.0.0.1) via next start."
+                    if local_deploy
+                    else "Deploy to Vercel (public URL) when DEPLOY_TARGET=vercel."
+                ),
+                "deploy_target": cfg.DEPLOY_TARGET,
                 "timeout_seconds": DEPLOYER_TIMEOUT_SECONDS,
             },
         )
         require_approval("deployer")
         emit("deployer", "running")
 
-        deploy_task = Task(
-            description="Deploy the generated website to Vercel by calling the deploy_to_vercel tool. Return the live URL.",
-            expected_output="The live production URL from Vercel.",
-            agent=deployer_agent,
-        )
-
-        deploy_crew = Crew(
-            agents=[deployer_agent],
-            tasks=[deploy_task],
-            process=Process.sequential,
-            verbose=True,
-        )
-
-        try:
-            ensure_not_stopped()
-            deploy_result = _kickoff_with_timeout(
-                deploy_crew,
-                "deployer",
-                timeout_seconds=DEPLOYER_TIMEOUT_SECONDS,
-                on_empty_retry=lambda info: emit(
-                    "trace",
-                    "result",
-                    {
-                        "agent": "deployer",
-                        "decision": "empty_llm_response_retry",
-                        **info,
-                    },
-                ),
-            )
+        if local_deploy:
             try:
-                deploy_data = json.loads(deploy_result.raw)
-                deployed_url = deploy_data.get("url")
-            except (json.JSONDecodeError, ValueError):
-                deployed_url = deploy_result.raw.strip()
-            emit("deployer", "done", {"url": deployed_url})
-        except Exception as e:
-            emit("deployer", "failed", {"error": str(e)})
+                ensure_not_stopped()
+                from agent.deployer import deploy_local_server
+
+                deployed_url = deploy_local_server()
+                emit(
+                    "deployer",
+                    "done",
+                    {"url": deployed_url, "local_only": True},
+                )
+            except Exception as e:
+                emit("deployer", "failed", {"error": str(e)})
+        else:
+            deploy_task = Task(
+                description="Deploy the generated website to Vercel by calling the deploy_to_vercel tool. Return the live URL.",
+                expected_output="The live production URL from Vercel.",
+                agent=deployer_agent,
+            )
+
+            deploy_crew = Crew(
+                agents=[deployer_agent],
+                tasks=[deploy_task],
+                process=Process.sequential,
+                verbose=True,
+            )
+
+            try:
+                ensure_not_stopped()
+                deploy_result = _kickoff_with_timeout(
+                    deploy_crew,
+                    "deployer",
+                    timeout_seconds=DEPLOYER_TIMEOUT_SECONDS,
+                    on_empty_retry=lambda info: emit(
+                        "trace",
+                        "result",
+                        {
+                            "agent": "deployer",
+                            "decision": "empty_llm_response_retry",
+                            **info,
+                        },
+                    ),
+                    should_stop=should_stop,
+                )
+                try:
+                    deploy_data = json.loads(deploy_result.raw)
+                    deployed_url = deploy_data.get("url")
+                except (json.JSONDecodeError, ValueError):
+                    deployed_url = deploy_result.raw.strip()
+                emit("deployer", "done", {"url": deployed_url})
+            except Exception as e:
+                emit("deployer", "failed", {"error": str(e)})
 
     elapsed = round(time.time() - pipeline_start, 1)
 

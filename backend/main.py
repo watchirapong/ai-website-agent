@@ -35,6 +35,7 @@ from agent.config import (
     OLLAMA_BASE_URL,
     ENABLE_TESTER,
     ENABLE_REVIEWER,
+    DEPLOY_TARGET,
 )
 
 app = FastAPI(title="AI Website Agent", version="1.0.0")
@@ -78,7 +79,8 @@ def startup():
         f"tester={TESTER_TIMEOUT_SECONDS}s "
         f"reviewer={REVIEWER_TIMEOUT_SECONDS}s "
         f"deployer={DEPLOYER_TIMEOUT_SECONDS}s "
-        f"flags(tester={ENABLE_TESTER}, reviewer={ENABLE_REVIEWER})"
+        f"flags(tester={ENABLE_TESTER}, reviewer={ENABLE_REVIEWER}) "
+        f"deploy_target={DEPLOY_TARGET}"
     )
 
 
